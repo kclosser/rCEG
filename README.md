@@ -4,6 +4,10 @@ This package accompanies the manuscript:
 
 **A split-architecture machine learning model for scalable HOMO-LUMO gap prediction: rCEG**
 
+## Author
+
+Isaac Wang
+
 ## Contents
 
 - `code/`: scripts used to prepare descriptors, generate Psi4 inputs, run single-point Psi4 calculations, process HOMO-LUMO gap outputs, train and evaluate rCEG models, perform QMugs overlap analysis, and generate figures.
