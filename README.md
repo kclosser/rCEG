@@ -8,7 +8,6 @@ This package accompanies the manuscript:
 
 - `code/`: scripts used to prepare descriptors, generate Psi4 inputs, run single-point Psi4 calculations, process HOMO-LUMO gap outputs, train and evaluate rCEG models, perform QMugs overlap analysis, and generate figures.
 - `data/`: processed machine-readable tables used for calibration, held-out testing, external QMugs overlap evaluation, model metrics, and figure generation. Some data provided in zip files due to large size and enhanced_dataset_lasso_strict.jsonl is split into 11 pieces. 
-- `psi4_inputs/`: available Psi4 recomputation manifests and input geometry files.
 - `figures/`: figure-generation outputs and plotted figure files.
 - `models/`: saved model files, if present.
 - `environment.yml` or `requirements.txt`: software environment information.
