@@ -1,4 +1,4 @@
-# rCEG JCTC Reproducibility Package
+# rCEG Reproducibility Package
 
 This package accompanies the manuscript:
 
