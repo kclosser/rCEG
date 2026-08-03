@@ -1,0 +1,3 @@
+evaluation,n,mae_ev,r2,pearson_r,median_signed_residual_ev,mean_signed_residual_ev
+Frozen external transfer,9753,4.1825779850556835,-14.471495870534266,0.7928833376536184,4.172079116051805,4.1825779850556835
+Five-fold cross-fitted offset aligned,9753,0.5119137356841809,0.6121419478945807,,,

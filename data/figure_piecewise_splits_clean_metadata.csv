@@ -1,0 +1,6 @@
+domain,domain_label,selected_feature,x_axis_meaning,split_threshold,linear_mae_improvement_ev
+charged_or_radical,Charged/radical,x47,Numerical value of the selected molecular descriptor feature for each molecule.,-0.4510865226387978,0.4473661054723945
+near_qm9_larger_organic,Near-QM9 larger organic,x13,Numerical value of the selected molecular descriptor feature for each molecule.,12.529999732971191,0.1943151506673276
+qm9_like_small_organic,QM9-like small organic,x15,Numerical value of the selected molecular descriptor feature for each molecule.,-0.4000000059604645,0.1275060841943449
+heteroatom_rich_non_qm9,Heteroatom-rich non-QM9,x260,Numerical value of the selected molecular descriptor feature for each molecule.,1131.0684814453125,0.1155460138964958
+large_neutral_organic,Large neutral organic,x316,Numerical value of the selected molecular descriptor feature for each molecule.,910.1978424072267,0.0472164296035676
