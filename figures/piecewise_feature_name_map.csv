@@ -1,0 +1,6 @@
+feature,lasso_index,descriptor_name,interpretable_label,chemical_interpretation,domain,split_value,improvement,domain_n,resolution_confidence,is_morgan_bit
+x47,42,BCUT2D_MRLOW,"BCUT2D eigenvalue, molar-refractivity weighted (lowest)",,charged_or_radical,-0.451125306636095,0.4700415345709328,6882,unique,False
+x260,255,Ipc,Information content of the characteristic polynomial,,heteroatom_rich_non_qm9,1186.695410156251,0.1123201615942278,20773,unique,False
+x29,24,VSA_EState6,"EState-weighted van der Waals surface area, bin 6",,large_neutral_organic,0.0,0.038100785251937,18098,unique,False
+x13,8,TPSA,Topological polar surface area (A^2),,near_qm9_larger_organic,12.529999732971191,0.2112207507377018,23523,unique,False
+x15,10,HallKierAlpha,Hall-Kier alpha shape correction,,qm9_like_small_organic,-0.4000000059604645,0.1345404857117331,4264,unique,False

@@ -1,0 +1,3 @@
+series,n_reference_molecules,n_joined_raw_string,n_plotted,join_method,pearson_r_molweight_exactmass,exact_mass_panel_dropped_reason
+PQR–QM9 overlap,133798,604,1228,RDKit canonical SMILES on both sides,0.9939485343345527,"collinear with molecular weight, measured r=0.9939"
+Psi4-recomputed PQR,909,99,909,RDKit canonical SMILES on both sides,0.9939485343345527,"collinear with molecular weight, measured r=0.9939"
