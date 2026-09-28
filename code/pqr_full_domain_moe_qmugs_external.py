@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import zlib
 from pathlib import Path
 from collections import Counter
 
@@ -41,6 +42,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler, StandardScaler, PowerTransformer
+
+
+def stable_seed(s, modulo=10000):
+    """
+    Process-stable replacement for abs(hash(str)) % modulo.
+
+    Python randomizes str hashes per process unless PYTHONHASHSEED is set,
+    which made piecewise branch-expert seeds vary between otherwise identical
+    runs. zlib.crc32 is deterministic on every platform and interpreter.
+    """
+    return zlib.crc32(s.encode("utf-8")) % modulo
 
 
 def fnum(x):
@@ -293,6 +305,27 @@ def leakage_filter(df, audit, threshold, outdir):
     return keep
 
 
+class DeterministicPipeline(Pipeline):
+    """
+    Pipeline that switches its final estimator to single-threaded prediction
+    after fitting.
+
+    sklearn's forests accumulate per-tree predictions in parallel in whatever
+    order the workers finish, so float non-associativity makes predict() vary
+    by ~8e-15 between otherwise identical processes. Fitting is unaffected and
+    stays parallel; only prediction is serialised, which is cheap. Without this
+    the pipeline is reproducible to about 1e-9 but not bit-identical, because a
+    value sitting on a rounding boundary can round either way.
+    """
+
+    def fit(self, X, y=None, **kw):
+        super().fit(X, y, **kw)
+        est = self.named_steps.get("model")
+        if est is not None and hasattr(est, "n_jobs"):
+            est.n_jobs = 1
+        return self
+
+
 def pipe(model, scale=True):
     steps = [
         ("imp", SimpleImputer(strategy="median")),
@@ -301,7 +334,7 @@ def pipe(model, scale=True):
     if scale:
         steps.append(("scale", RobustScaler(with_centering=False)))
     steps.append(("model", model))
-    return Pipeline(steps)
+    return DeterministicPipeline(steps)
 
 
 def et(seed, n=500):
@@ -325,7 +358,7 @@ def rf(seed, n=400):
 
 
 def hgb(seed):
-    return Pipeline([
+    return DeterministicPipeline([
         ("imp", SimpleImputer(strategy="median")),
         ("var", VarianceThreshold(1e-12)),
         ("model", HistGradientBoostingRegressor(
@@ -445,6 +478,604 @@ def add_confidence(pqr, ref_train, ref_val, ref_test, feat_cols):
     return pqr
 
 
+def _line_mae(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x = x[ok]
+    y = y[ok]
+    if len(y) < 50 or np.nanstd(x) < 1e-12:
+        return np.inf
+    A = np.column_stack([x, np.ones(len(x))])
+    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    pred = A @ coef
+    return float(np.mean(np.abs(pred - y)))
+
+
+def _best_piecewise_split(Xdf, y, candidate_cols, min_leaf=300, max_features=40):
+    """
+    Find the (x-feature, breakpoint) pair whose two local linear fits beat a
+    single global line by the largest margin. Uses only x-features and the
+    training label -- no gap-derived quantity defines the split.
+    """
+    y = np.asarray(y, dtype=float)
+
+    # Rank candidate x-features by absolute correlation with the training label.
+    ranked = []
+    for c in candidate_cols:
+        x = pd.to_numeric(Xdf[c], errors="coerce").to_numpy(dtype=float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        if ok.sum() < 2 * min_leaf:
+            continue
+        if np.nanstd(x[ok]) < 1e-12:
+            continue
+        corr = np.corrcoef(x[ok], y[ok])[0, 1]
+        if np.isfinite(corr):
+            ranked.append((c, abs(corr), corr))
+
+    ranked = sorted(ranked, key=lambda z: z[1], reverse=True)[:max_features]
+
+    best = None
+
+    for c, abs_corr, corr in ranked:
+        x = pd.to_numeric(Xdf[c], errors="coerce").to_numpy(dtype=float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        x_ok = x[ok]
+        y_ok = y[ok]
+
+        if len(y_ok) < 2 * min_leaf:
+            continue
+
+        base_mae = _line_mae(x_ok, y_ok)
+
+        # Candidate breakpoints between the 20th and 80th percentiles.
+        qs = np.linspace(0.20, 0.80, 25)
+        cuts = np.unique(np.quantile(x_ok, qs))
+
+        for cut in cuts:
+            left = x_ok <= cut
+            right = ~left
+
+            if left.sum() < min_leaf or right.sum() < min_leaf:
+                continue
+
+            mae_left = _line_mae(x_ok[left], y_ok[left])
+            mae_right = _line_mae(x_ok[right], y_ok[right])
+
+            if not np.isfinite(mae_left) or not np.isfinite(mae_right):
+                continue
+
+            piece_mae = (left.sum() * mae_left + right.sum() * mae_right) / len(y_ok)
+            improvement = base_mae - piece_mae
+
+            rec = {
+                "feature": c,
+                "corr": float(corr),
+                "abs_corr": float(abs_corr),
+                "split_value": float(cut),
+                "single_line_mae": float(base_mae),
+                "piecewise_line_mae": float(piece_mae),
+                "improvement": float(improvement),
+                "left_n": int(left.sum()),
+                "right_n": int(right.sum()),
+            }
+
+            if best is None or rec["improvement"] > best["improvement"]:
+                best = rec
+
+    return best
+
+
+# ======================================================================
+# Split protocols (spec C3)
+# ======================================================================
+
+def murcko_scaffold(smiles):
+    """
+    Bemis-Murcko scaffold SMILES. Acyclic molecules yield an empty scaffold;
+    those are given per-molecule unique group ids rather than being collapsed
+    into one giant group, which the spec calls out explicitly.
+    """
+    from rdkit.Chem.Scaffolds import MurckoScaffold
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        return MurckoScaffold.MurckoScaffoldSmiles(mol=mol, includeChirality=False)
+    except Exception:
+        return None
+
+
+def assign_split_groups(smiles_list, mode, cutoff=0.6, seed=42):
+    """
+    Return an integer group id per molecule. Molecules sharing a group id must
+    land in the same partition.
+
+      random   -> every molecule its own group (ordinary random splitting)
+      scaffold -> Bemis-Murcko scaffold; acyclic molecules stay singletons
+      cluster  -> Butina clustering on Morgan-fingerprint Tanimoto
+
+    Morgan fingerprints are used here purely as a SIMILARITY METRIC for
+    grouping. Note that the descriptor block already contains 176 Morgan bits
+    (see lasso_selected_feature_names.json), so this is not an independence
+    claim about the feature set.
+    """
+    n = len(smiles_list)
+
+    if mode == "random":
+        return np.arange(n)
+
+    if mode == "scaffold":
+        groups = np.empty(n, dtype=np.int64)
+        lookup = {}
+        next_id = 0
+        n_acyclic = 0
+        for i, smi in enumerate(smiles_list):
+            scaf = murcko_scaffold(smi)
+            if not scaf:
+                # Empty scaffold (acyclic). Keep as its own singleton group.
+                groups[i] = -(i + 1)
+                n_acyclic += 1
+                continue
+            if scaf not in lookup:
+                lookup[scaf] = next_id
+                next_id += 1
+            groups[i] = lookup[scaf]
+        print(f"    scaffold groups: {next_id:,} ring scaffolds, "
+              f"{n_acyclic:,} acyclic singletons")
+        return groups
+
+    if mode == "cluster":
+        from rdkit.Chem import AllChem
+        from rdkit import DataStructs
+        from rdkit.ML.Cluster import Butina
+
+        fps, valid = [], []
+        for i, smi in enumerate(smiles_list):
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                continue
+            fps.append(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048))
+            valid.append(i)
+
+        dists = []
+        for i in range(1, len(fps)):
+            sims = DataStructs.BulkTanimotoSimilarity(fps[i], fps[:i])
+            dists.extend(1.0 - s for s in sims)
+
+        clusters = Butina.ClusterData(dists, len(fps), 1.0 - cutoff,
+                                      isDistData=True)
+        groups = np.full(n, -1, dtype=np.int64)
+        for cid, members in enumerate(clusters):
+            for m in members:
+                groups[valid[m]] = cid
+        # Anything unassigned becomes its own singleton.
+        for i in range(n):
+            if groups[i] < 0:
+                groups[i] = 10_000_000 + i
+        print(f"    Butina clusters at Tanimoto {cutoff}: {len(clusters):,}")
+        return groups
+
+    raise ValueError(f"Unknown split mode: {mode}")
+
+
+def grouped_three_way_split(groups, seed, frac_cal=0.60, frac_val=0.20):
+    """
+    Partition indices into calibration / validation / test so that no group
+    straddles two partitions. Groups are shuffled, then greedily packed until
+    each partition reaches its target size.
+    """
+    rng = np.random.default_rng(seed)
+    uniq = np.unique(groups)
+    rng.shuffle(uniq)
+
+    members = {g: np.where(groups == g)[0] for g in uniq}
+    n_total = len(groups)
+    n_cal_target = int(round(frac_cal * n_total))
+    n_val_target = int(round(frac_val * n_total))
+
+    cal, val, test = [], [], []
+    for g in uniq:
+        idx = members[g]
+        if len(cal) < n_cal_target:
+            cal.extend(idx)
+        elif len(val) < n_val_target:
+            val.extend(idx)
+        else:
+            test.extend(idx)
+
+    return np.array(cal, dtype=int), np.array(val, dtype=int), np.array(test, dtype=int)
+
+
+def max_tanimoto_to_train(test_smiles, train_smiles, sample_train=4000, seed=42):
+    """Mean/median nearest-neighbour Tanimoto from each test molecule to train."""
+    from rdkit.Chem import AllChem
+    from rdkit import DataStructs
+
+    rng = np.random.default_rng(seed)
+    if len(train_smiles) > sample_train:
+        train_smiles = list(rng.choice(np.asarray(train_smiles, dtype=object),
+                                       sample_train, replace=False))
+
+    def fp(s):
+        m = Chem.MolFromSmiles(s)
+        return AllChem.GetMorganFingerprintAsBitVect(m, 2, nBits=2048) if m else None
+
+    tr = [f for f in (fp(s) for s in train_smiles) if f is not None]
+    if not tr:
+        return np.nan, np.nan
+
+    best = []
+    for s in test_smiles:
+        f = fp(s)
+        if f is None:
+            continue
+        best.append(max(DataStructs.BulkTanimotoSimilarity(f, tr)))
+
+    if not best:
+        return np.nan, np.nan
+    return float(np.mean(best)), float(np.median(best))
+
+
+def permute_domains_preserving_sizes(domains, seed):
+    """
+    Shuffle domain labels across molecules while preserving the exact size of
+    every domain (spec C4). A straight permutation of the label array does
+    this by construction.
+    """
+    rng = np.random.default_rng(seed)
+    out = np.array(domains, dtype=object).copy()
+    rng.shuffle(out)
+    return out
+
+
+def full_metrics(y, pred):
+    """
+    Metrics, quantised to 10 decimal places.
+
+    sklearn forests accumulate per-tree predictions in parallel in completion
+    order, so repeated runs differ by ~8e-15 through float non-associativity.
+    That is 13 orders of magnitude below anything reported, but it makes output
+    files fail a byte-identical reproducibility check. Quantising here makes
+    repeated runs at the same seed produce identical CSVs.
+    """
+    y = np.asarray(y, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    err = pred - y
+    q = 10
+    return {
+        "mae": round(float(mean_absolute_error(y, pred)), q),
+        "rmse": round(float(np.sqrt(np.mean(err ** 2))), q),
+        "r2": round(float(r2_score(y, pred)), q),
+        "median_abs_error": round(float(np.median(np.abs(err))), q),
+        "mean_signed_error": round(float(np.mean(err)), q),
+        "n": int(len(y)),
+    }
+
+
+def fit_calibration_ensemble(ref_cal, ref_val, feat_cols, seed, top_k=3):
+    """
+    Fit the calibration candidates on ref_cal, rank by ref_val MAE, and return
+    a 1/MAE-weighted top-k ensemble as a callable, plus its member metrics.
+    """
+    Xc_gap = ref_cal[["pqr_gap"]].to_numpy()
+    Xv_gap = ref_val[["pqr_gap"]].to_numpy()
+    Xc_full = ref_cal[["pqr_gap"] + feat_cols].to_numpy()
+    Xv_full = ref_val[["pqr_gap"] + feat_cols].to_numpy()
+    yc = ref_cal["ref_gap"].to_numpy()
+    yv = ref_val["ref_gap"].to_numpy()
+
+    cands = {
+        "gap_linear_robust":  (linear_scaled("robust"),   Xc_gap,  Xv_gap,  "gap"),
+        "gap_ridge_robust":   (ridge_scaled("robust"),    Xc_gap,  Xv_gap,  "gap"),
+        "gap_ridge_standard": (ridge_scaled("standard"),  Xc_gap,  Xv_gap,  "gap"),
+        "gap_ridge_power":    (ridge_scaled("power"),     Xc_gap,  Xv_gap,  "gap"),
+        "desc_ridge_robust":  (ridge_scaled("robust"),    Xc_full, Xv_full, "full"),
+        "desc_hgb":           (hgb(seed + 10),            Xc_full, Xv_full, "full"),
+        "desc_et":            (et(seed + 20, n=700),      Xc_full, Xv_full, "full"),
+        "desc_rf":            (rf(seed + 30, n=500),      Xc_full, Xv_full, "full"),
+    }
+
+    fitted, scores = {}, {}
+    for name, (model, Xc, Xv, mode) in cands.items():
+        try:
+            model.fit(Xc, yc)
+        except Exception as exc:
+            finite = np.isfinite(Xc).sum(axis=0)
+            with np.errstate(all="ignore"):
+                variances = np.nanvar(Xc, axis=0)
+            raise RuntimeError(
+                f"calibration candidate '{name}' failed to fit.\n"
+                f"  X shape        : {Xc.shape}\n"
+                f"  y shape        : {np.shape(yc)}\n"
+                f"  finite per col : {finite[:8]}{' ...' if Xc.shape[1] > 8 else ''}\n"
+                f"  variance/col   : {np.round(variances[:8], 8)}"
+                f"{' ...' if Xc.shape[1] > 8 else ''}\n"
+                f"  n all-NaN cols : {int((finite == 0).sum())}\n"
+                f"  original error : {type(exc).__name__}: {exc}"
+            ) from exc
+        scores[name] = mean_absolute_error(yv, model.predict(Xv))
+        fitted[name] = (model, mode)
+
+    # Determinism guard.
+    #
+    # Candidate validation MAEs differ between processes at the 1e-17 level,
+    # because RandomForest with n_jobs=-1 accumulates tree predictions in a
+    # non-fixed order. That noise flows into the 1/MAE ensemble weights, then
+    # into the pseudo-labels for all 74k molecules. Tree learners then AMPLIFY
+    # it: a 1e-15 shift in y can flip a near-tied split near the root of an
+    # ExtraTrees tree, which changes an entire subtree. The measured end effect
+    # was up to 0.096 eV on individual predictions from a 1e-15 input change.
+    #
+    # Quantising the scores to 12 decimal places removes the sensitivity at
+    # source. 1e-12 eV is ~10 orders of magnitude below anything reported.
+    scores = {k: round(float(v), 12) for k, v in scores.items()}
+    top = sorted(scores, key=lambda k: (scores[k], k))[:top_k]
+    maes = np.array([scores[n] for n in top])
+    w = 1.0 / np.maximum(maes, 1e-6)
+    w = np.round(w / w.sum(), 12)
+
+    def predict(df):
+        Xg = df[["pqr_gap"]].to_numpy()
+        Xf = df[["pqr_gap"] + feat_cols].to_numpy()
+        out = np.zeros(len(df), dtype=float)
+        for name, wi in zip(top, w):
+            model, mode = fitted[name]
+            out += wi * model.predict(Xg if mode == "gap" else Xf)
+        # Second guard: quantise the pseudo-labels themselves, so any residual
+        # float noise upstream cannot reach the tree learners' split selection.
+        return np.round(out, 9)
+
+    return predict, top, w, scores
+
+
+def _train_domain_and_piecewise(Xtrain, ytrain, train_domains, train_pool, feat_cols,
+                                Xt, test_domains, ref_test, global_mean_test, seed,
+                                min_domain=500, min_piecewise=1000, collect_splits=None):
+    """
+    Train per-domain experts and, where a useful within-domain breakpoint
+    exists, left/right branch experts. Returns (domain_pred, piecewise_pred)
+    on the test partition.
+    """
+    dom_t = np.array(global_mean_test, dtype=float).copy()
+    domain_models = {}
+
+    for domain in sorted(pd.unique(train_domains)):
+        mtr = train_domains == domain
+        mt = test_domains == domain
+        if int(mtr.sum()) < min_domain:
+            continue
+        model = et(seed + 200 + stable_seed(str(domain), 500), n=500)
+        model.fit(Xtrain[mtr], ytrain[mtr])
+        domain_models[domain] = model
+        if mt.any():
+            dom_t[mt] = model.predict(Xt[mt])
+
+    piece_t = dom_t.copy()
+
+    for domain in sorted(pd.unique(train_domains)):
+        mtr = train_domains == domain
+        mt = test_domains == domain
+        n_domain = int(mtr.sum())
+        if n_domain < min_piecewise:
+            continue
+
+        split = _best_piecewise_split(
+            train_pool.loc[mtr, feat_cols], ytrain[mtr], feat_cols,
+            min_leaf=max(250, min(750, n_domain // 12)), max_features=50,
+        )
+        if split is None or split["improvement"] <= 0:
+            continue
+
+        feature, cut = split["feature"], split["split_value"]
+        if collect_splits is not None:
+            rec = dict(split)
+            rec["domain"] = domain
+            rec["domain_n"] = n_domain
+            collect_splits.append(rec)
+
+        xtr = pd.to_numeric(train_pool.loc[mtr, feature], errors="coerce").to_numpy(float)
+        left_tr, right_tr = xtr <= cut, xtr > cut
+        Xd = Xtrain[mtr]
+        yd = ytrain[mtr]
+
+        lm = et(seed + 700 + stable_seed(str(domain) + feature + "L"), n=500)
+        rm = et(seed + 800 + stable_seed(str(domain) + feature + "R"), n=500)
+        lm.fit(Xd[left_tr], yd[left_tr])
+        rm.fit(Xd[right_tr], yd[right_tr])
+
+        if mt.any():
+            ti = np.where(mt)[0]
+            xte = pd.to_numeric(ref_test.loc[mt, feature], errors="coerce").to_numpy(float)
+            lmask, rmask = xte <= cut, xte > cut
+            if lmask.any():
+                piece_t[ti[lmask]] = lm.predict(Xt[ti[lmask]])
+            if rmask.any():
+                piece_t[ti[rmask]] = rm.predict(Xt[ti[rmask]])
+
+    return dom_t, piece_t
+
+
+def run_repeat(pqr, ref_pqr, feat_cols, seed, repeat_idx, split_mode,
+               groups, want_permutation=True, collect_splits=None,
+               calibration_group_rows=None):
+    """
+    One complete re-split / re-calibrate / re-train / re-evaluate cycle
+    (spec C2). Pseudo-labels are regenerated inside the loop so no earlier
+    split can leak through them.
+
+    Returns {config_key: {metric: value}} evaluated on this repeat's test
+    partition, plus the per-domain breakdown for the primary repeat.
+    """
+    cal_idx, val_idx, test_idx = grouped_three_way_split(groups, seed)
+
+    ref_cal = ref_pqr.iloc[cal_idx].copy()
+    ref_val = ref_pqr.iloc[val_idx].copy()
+    ref_test = ref_pqr.iloc[test_idx].copy()
+
+    print(f"  [repeat {repeat_idx}] seed={seed} "
+          f"cal={len(ref_cal)} val={len(ref_val)} test={len(ref_test)}")
+
+    # ---- calibration, refit from scratch every repeat ----
+    cal_predict, top, w, cal_scores = fit_calibration_ensemble(
+        ref_cal, ref_val, feat_cols, seed)
+
+    # ---- A4: calibration quality on held-out reference only ----
+    if calibration_group_rows is not None:
+        heldout = pd.concat([ref_val, ref_test], ignore_index=True)
+        heldout = heldout.copy()
+        heldout["cal_pred"] = cal_predict(heldout)
+        heldout["pqr_minus_ref"] = heldout["pqr_gap"] - heldout["ref_gap"]
+
+        def _emit(group_type, group, sub):
+            if len(sub) < 2:
+                return
+            m = full_metrics(sub["ref_gap"], sub["cal_pred"])
+            calibration_group_rows.append({
+                "repeat": repeat_idx, "group_type": group_type, "group": group,
+                "n": len(sub), "mae": m["mae"], "rmse": m["rmse"], "r2": m["r2"],
+                "mean_pqr_minus_ref": float(sub["pqr_minus_ref"].mean()),
+                "sd_pqr_minus_ref": float(sub["pqr_minus_ref"].std(ddof=1)),
+            })
+
+        for d, sub in heldout.groupby("domain"):
+            _emit("domain", d, sub)
+        if "ref_source" in heldout.columns:
+            for s, sub in heldout.groupby("ref_source"):
+                _emit("source", s, sub)
+        _emit("overall", "all", heldout)
+
+    # ---- pseudo-labels for the whole corpus ----
+    pseudo = cal_predict(pqr)
+    labels = pseudo.copy()
+
+    anchor = dict(zip(ref_cal["smiles"], ref_cal["ref_gap"]))
+    is_anchor = pqr["smiles"].isin(anchor).to_numpy()
+    labels[is_anchor] = pqr.loc[is_anchor, "smiles"].map(anchor).to_numpy()
+
+    holdout = set(ref_val["smiles"]) | set(ref_test["smiles"])
+    keep = ~pqr["smiles"].isin(holdout).to_numpy()
+    train_pool = pqr.loc[keep].copy()
+    ytrain = labels[keep]
+
+    Xtrain = train_pool[feat_cols].to_numpy()
+    Xt = ref_test[feat_cols].to_numpy()
+    Xv = ref_val[feat_cols].to_numpy()
+    ytest = ref_test["ref_gap"].to_numpy()
+    yval = ref_val["ref_gap"].to_numpy()
+
+    results = {}
+    pred_t, pred_v = {}, {}
+
+    # ---- global experts ----
+    models = {
+        "global_hgb":   hgb(seed + 100),
+        "global_et":    et(seed + 110, n=700),
+        "global_rf":    rf(seed + 120, n=500),
+        "global_ridge": ridge_scaled("robust"),
+    }
+    for key, m in models.items():
+        m.fit(Xtrain, ytrain)
+        pred_t[key] = m.predict(Xt)
+        pred_v[key] = m.predict(Xv)
+        results[key] = full_metrics(ytest, pred_t[key])
+
+    pred_t["global_mean"] = (pred_t["global_hgb"] + pred_t["global_et"]
+                             + pred_t["global_rf"]) / 3.0
+    pred_v["global_mean"] = (pred_v["global_hgb"] + pred_v["global_et"]
+                             + pred_v["global_rf"]) / 3.0
+    results["global_mean"] = full_metrics(ytest, pred_t["global_mean"])
+
+    # ---- domain + piecewise on TRUE domain labels ----
+    train_domains = train_pool["domain"].to_numpy()
+    test_domains = ref_test["domain"].to_numpy()
+
+    dom_t, piece_t = _train_domain_and_piecewise(
+        Xtrain, ytrain, train_domains, train_pool, feat_cols,
+        Xt, test_domains, ref_test, pred_t["global_mean"], seed,
+        collect_splits=collect_splits)
+
+    pred_t["domain_expert"] = dom_t
+    pred_t["piecewise_split"] = piece_t
+    results["domain_expert"] = full_metrics(ytest, dom_t)
+    results["piecewise_split"] = full_metrics(ytest, piece_t)
+
+    # ---- full_rceg: ridge meta-learner fitted on VAL, reported on TEST ----
+    # The previous code fitted on Pv then predicted Pv, so its validation
+    # number was in-sample. Only the test number is reported now.
+    dom_v, piece_v = _train_domain_and_piecewise(
+        Xtrain, ytrain, train_domains, train_pool, feat_cols,
+        Xv, ref_val["domain"].to_numpy(), ref_val, pred_v["global_mean"], seed)
+    pred_v["domain_expert"] = dom_v
+    pred_v["piecewise_split"] = piece_v
+
+    stack_keys = ["global_hgb", "global_et", "global_rf", "global_ridge",
+                  "global_mean", "domain_expert", "piecewise_split"]
+    Pv = np.column_stack([pred_v[k] for k in stack_keys])
+    Pt = np.column_stack([pred_t[k] for k in stack_keys])
+
+    stacker = Pipeline([("scale", StandardScaler()),
+                        ("model", RidgeCV(alphas=np.logspace(-6, 5, 60)))])
+    # ------------------------------------------------------------------
+    # The stacker is FITTED on the validation partition, so a raw validation
+    # score for it is in-sample and cannot be compared against the other
+    # configurations. Architecture selection must happen on validation, never
+    # on test, so an honest out-of-fold validation MAE is cross-fitted within
+    # the validation partition here. The stacker used for the TEST prediction
+    # is still fitted on all of validation, which is legitimate because test is
+    # untouched.
+    # ------------------------------------------------------------------
+    from sklearn.model_selection import KFold
+
+    oof = np.zeros(len(yval), dtype=float)
+    kf = KFold(n_splits=5, shuffle=True, random_state=seed)
+    for fit_idx, hold_idx in kf.split(Pv):
+        s_cv = Pipeline([("scale", StandardScaler()),
+                         ("model", RidgeCV(alphas=np.logspace(-6, 5, 60)))])
+        s_cv.fit(Pv[fit_idx], yval[fit_idx])
+        oof[hold_idx] = s_cv.predict(Pv[hold_idx])
+    val_mae_full_rceg = round(float(mean_absolute_error(yval, oof)), 10)
+
+    stacker.fit(Pv, yval)
+    pred_t["full_rceg"] = stacker.predict(Pt)
+    results["full_rceg"] = full_metrics(ytest, pred_t["full_rceg"])
+    results["full_rceg"]["val_mae_crossfit"] = val_mae_full_rceg
+    results["full_rceg"]["val_mae_in_sample_DO_NOT_REPORT"] = float(
+        mean_absolute_error(yval, stacker.predict(Pv)))
+
+    # ---- no_exact_mass ablation: drop x1 ----
+    feat_nx1 = [c for c in feat_cols if c != "x1"]
+    Xtr2 = train_pool[feat_nx1].to_numpy()
+    Xv2 = ref_val[feat_nx1].to_numpy()
+    Xt2 = ref_test[feat_nx1].to_numpy()
+    m2 = et(seed + 110, n=700)
+    m2.fit(Xtr2, ytrain)
+    results["no_exact_mass"] = full_metrics(ytest, m2.predict(Xt2))
+    pred_v["no_exact_mass"] = m2.predict(Xv2)
+
+    # ---- domain permutation control (spec C4) ----
+    if want_permutation:
+        perm_train = permute_domains_preserving_sizes(train_domains, seed)
+        perm_test = permute_domains_preserving_sizes(test_domains, seed + 7)
+        pdom_t, ppiece_t = _train_domain_and_piecewise(
+            Xtrain, ytrain, perm_train, train_pool, feat_cols,
+            Xt, perm_test, ref_test, pred_t["global_mean"], seed)
+        results["domain_permuted"] = full_metrics(ytest, pdom_t)
+        results["domain_permuted_piecewise"] = full_metrics(ytest, ppiece_t)
+
+    for k in results:
+        if k == "full_rceg":
+            # honest out-of-fold value; the in-sample one is never used
+            results[k]["val_mae"] = round(float(val_mae_full_rceg), 10)
+        elif k in pred_v:
+            results[k]["val_mae"] = round(
+                float(mean_absolute_error(yval, pred_v[k])), 10)
+        else:
+            results[k]["val_mae"] = np.nan
+
+    return results, ref_test, pred_t
+
+
 def qedges(y, k):
     edges = np.percentile(y, np.linspace(0, 100, k + 1))
     edges[0] = -np.inf
@@ -466,6 +1097,21 @@ def main():
     ap.add_argument("--leakage-corr-threshold", type=float, default=0.98)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-models", action="store_true")
+    # ---- ACS Omega revision flags (spec C1-C5, A4) ----
+    ap.add_argument("--n-repeats", type=int, default=10,
+                    help="Repeated reference splits for dispersion (spec C2). 1 disables.")
+    ap.add_argument("--split-mode", choices=["random", "scaffold", "cluster"],
+                    default="random",
+                    help="Partition protocol for the reference pool (spec C3).")
+    ap.add_argument("--cluster-cutoff", type=float, default=0.6,
+                    help="Butina Tanimoto cutoff when --split-mode cluster.")
+    ap.add_argument("--emit-calibration-by-group", action="store_true",
+                    help="Emit calibration_by_domain_and_source.csv (spec A4).")
+    ap.add_argument("--emit-permutation-control", action="store_true",
+                    help="Emit domain_permutation_control.csv (spec C4).")
+    ap.add_argument("--skip-legacy-single-run", action="store_true",
+                    help="Only run the repeated-splits analysis, skip the "
+                         "original single-run artifact path.")
     ap.add_argument(
         "--external-ref",
         default=None,
@@ -544,6 +1190,28 @@ def main():
             f"from all model-development stages."
         )
 
+        # ------------------------------------------------------------------
+        # Spec C5: make the excision checkable rather than merely asserted in
+        # prose. Fail loudly if any external SMILES survives into the training
+        # corpus, the reference pool, or the leakage-audit input.
+        # ------------------------------------------------------------------
+        contamination = {
+            "training_corpus": set(pqr["smiles"]) & external_smiles,
+            "reference_pool": set(ref["smiles"]) & external_smiles,
+            "leakage_audit_input": set(audit["smiles"]) & external_smiles,
+        }
+        offenders = {k: v for k, v in contamination.items() if v}
+        if offenders:
+            raise RuntimeError(
+                "EXTERNAL HOLDOUT VIOLATION - QMugs molecules leaked into: "
+                + "; ".join(f"{k} ({len(v)} molecules, e.g. {sorted(v)[:3]})"
+                            for k, v in offenders.items())
+            )
+        print(
+            f"  [C5 assertion PASSED] 0 of {len(external_smiles):,} external "
+            f"SMILES present in training corpus, reference pool, or leakage audit."
+        )
+
     feat_cols = leakage_filter(pqr, audit, args.leakage_corr_threshold, outdir)
 
     # Hard no-leakage assertion.
@@ -582,6 +1250,175 @@ def main():
 
     if len(ref_pqr) < 300:
         raise RuntimeError("Too few reference-labeled molecules for honest validation.")
+
+    # ==================================================================
+    # Repeated-split analysis (spec C1-C4). Emits every dispersion table
+    # the revision needs. Runs before the legacy single-run path so that
+    # a crash later still leaves these artifacts on disk.
+    # ==================================================================
+    if args.n_repeats and args.n_repeats >= 1:
+        print("\n" + "=" * 70)
+        print(f"REPEATED-SPLIT ANALYSIS  n_repeats={args.n_repeats} "
+              f"split_mode={args.split_mode}")
+        print("=" * 70)
+
+        print("  assigning split groups ...")
+        groups = assign_split_groups(
+            list(ref_pqr["smiles"]), args.split_mode,
+            cutoff=args.cluster_cutoff, seed=args.seed)
+
+        ablation_rows = []
+        calib_rows = [] if args.emit_calibration_by_group else None
+        split_records = []
+        primary = None
+
+        for i in range(args.n_repeats):
+            rseed = args.seed + 1000 * i
+            res, rtest, rpred = run_repeat(
+                pqr, ref_pqr, feat_cols, rseed, i, args.split_mode, groups,
+                want_permutation=args.emit_permutation_control,
+                collect_splits=split_records if i == 0 else None,
+                calibration_group_rows=calib_rows,
+            )
+            if i == 0:
+                primary = (rtest, rpred)
+
+            for cfg, m in res.items():
+                ablation_rows.append({
+                    "config": cfg, "repeat": i, "seed": rseed,
+                    "split_mode": args.split_mode,
+                    "test_mae": m["mae"], "test_rmse": m["rmse"],
+                    "test_r2": m["r2"],
+                    "test_median_abs_error": m["median_abs_error"],
+                    "test_mean_signed_error": m["mean_signed_error"],
+                    "val_mae": m.get("val_mae", np.nan),
+                    "n_test": m["n"],
+                })
+
+        ab = pd.DataFrame(ablation_rows)
+        ab.to_csv(outdir / "ablation_repeated_splits.csv", index=False)
+
+        summary = (ab.groupby("config")
+                     .agg(mae_mean=("test_mae", "mean"),
+                          mae_sd=("test_mae", "std"),
+                          mae_min=("test_mae", "min"),
+                          mae_max=("test_mae", "max"),
+                          rmse_mean=("test_rmse", "mean"),
+                          r2_mean=("test_r2", "mean"),
+                          r2_sd=("test_r2", "std"),
+                          n_repeats=("test_mae", "size"))
+                     .reset_index()
+                     .sort_values("mae_mean"))
+        summary["split_mode"] = args.split_mode
+        summary.to_csv(outdir / "repeated_split_summary.csv", index=False)
+
+        print("\nRepeated-split summary (sorted by mean test MAE):")
+        print(summary.to_string(index=False))
+
+        # ---- spec 8.1 check: does domain_expert beat global_et by >1 SD? ----
+        try:
+            de = summary[summary.config == "domain_expert"].iloc[0]
+            ge = summary[summary.config == "global_et"].iloc[0]
+            delta = ge.mae_mean - de.mae_mean
+            pooled = float(np.sqrt((de.mae_sd ** 2 + ge.mae_sd ** 2) / 2))
+            verdict = "EXCEEDS" if delta > pooled else "DOES NOT EXCEED"
+            print(f"\n[spec 8.1] domain_expert vs global_et: "
+                  f"delta={delta:.4f} eV, pooled_sd={pooled:.4f} -> {verdict} 1 SD")
+        except Exception as exc:
+            print(f"[spec 8.1] check skipped: {exc}")
+
+        # ---- C4: permutation control ----
+        if args.emit_permutation_control and "domain_permuted" in set(ab.config):
+            t = ab[ab.config == "domain_expert"][["repeat", "test_mae"]]
+            p = ab[ab.config == "domain_permuted"][["repeat", "test_mae"]]
+            perm = t.merge(p, on="repeat", suffixes=("_true", "_perm"))
+            perm.columns = ["repeat", "mae_true_domains", "mae_permuted_domains"]
+            perm["delta"] = perm.mae_permuted_domains - perm.mae_true_domains
+            perm.to_csv(outdir / "domain_permutation_control.csv", index=False)
+            md = float(perm.delta.mean())
+            print(f"\n[spec 8.2] permutation control: mean delta={md:+.4f} eV "
+                  f"({'degrades as expected' if md > 0 else 'DOES NOT DEGRADE'})")
+
+        # ---- A4: calibration by domain and source ----
+        if calib_rows:
+            cg = pd.DataFrame(calib_rows)
+            agg = (cg.groupby(["group_type", "group"])
+                     .agg(n=("n", "mean"), mae=("mae", "mean"), rmse=("rmse", "mean"),
+                          r2=("r2", "mean"),
+                          mean_pqr_minus_ref=("mean_pqr_minus_ref", "mean"),
+                          sd_pqr_minus_ref=("sd_pqr_minus_ref", "mean"))
+                     .reset_index())
+            agg.to_csv(outdir / "calibration_by_domain_and_source.csv", index=False)
+            dom = agg[agg.group_type == "domain"]["mean_pqr_minus_ref"]
+            if len(dom):
+                off = {"OFF_MIN": float(dom.min()), "OFF_MAX": float(dom.max()),
+                       "OFF_MEAN": float(dom.mean())}
+                off["OFF_SPREAD"] = off["OFF_MAX"] - off["OFF_MIN"]
+                pd.DataFrame([off]).to_csv(outdir / "calibration_offsets.csv", index=False)
+                print(f"\n[spec 8.3] OFF_MIN={off['OFF_MIN']:.3f} "
+                      f"OFF_MAX={off['OFF_MAX']:.3f} "
+                      f"OFF_SPREAD={off['OFF_SPREAD']:.3f} "
+                      f"OFF_MEAN={off['OFF_MEAN']:.3f} eV")
+                if off["OFF_SPREAD"] > 1.0:
+                    print("  WARNING: OFF_SPREAD exceeds 1 eV -> calibration is "
+                          "strongly domain-dependent (spec A4 requires the "
+                          "manuscript paragraph be rewritten as a concession).")
+
+        # ---- C1: per-domain / per-source metrics on the primary repeat ----
+        if primary is not None:
+            rtest, rpred = primary
+            best = "piecewise_split" if "piecewise_split" in rpred else "domain_expert"
+            rep = rtest[["smiles", "ref_gap", "domain"]].copy()
+            if "ref_source" in rtest.columns:
+                rep["ref_source"] = rtest["ref_source"].values
+            # quantised for the same reason as full_metrics
+            rep["pred"] = np.round(rpred[best], 9)
+            rows = []
+            for gt, col in [("domain", "domain"), ("source", "ref_source")]:
+                if col not in rep.columns:
+                    continue
+                for g, sub in rep.groupby(col):
+                    m = full_metrics(sub["ref_gap"], sub["pred"])
+                    rows.append({"group_type": gt, "group": g, **m})
+            m = full_metrics(rep["ref_gap"], rep["pred"])
+            rows.append({"group_type": "overall", "group": "all", **m})
+            pd.DataFrame(rows).to_csv(outdir / "mae_by_domain.csv", index=False)
+            rep.to_csv(outdir / "figure6_data.csv", index=False)
+            print(f"\nWrote mae_by_domain.csv and figure6_data.csv "
+                  f"(model={best})")
+
+        if split_records:
+            pd.DataFrame(split_records).to_csv(
+                outdir / "piecewise_split_architecture_branches.csv", index=False)
+
+        # ---- C3: split-protocol comparison row ----
+        try:
+            cal_i, val_i, test_i = grouped_three_way_split(groups, args.seed)
+            tr_smi = list(ref_pqr.iloc[np.concatenate([cal_i, val_i])]["smiles"])
+            te_smi = list(ref_pqr.iloc[test_i]["smiles"])
+            mean_t, med_t = max_tanimoto_to_train(te_smi, tr_smi, seed=args.seed)
+        except Exception as exc:
+            mean_t = med_t = np.nan
+            print(f"  tanimoto summary skipped: {exc}")
+
+        best_cfg = summary.iloc[0]
+        pd.DataFrame([{
+            "split_mode": args.split_mode,
+            "best_config": best_cfg.config,
+            "test_mae": best_cfg.mae_mean, "test_mae_sd": best_cfg.mae_sd,
+            "test_rmse": best_cfg.rmse_mean, "test_r2": best_cfg.r2_mean,
+            "n_test": int(ab[ab.config == best_cfg.config]["n_test"].mean()),
+            "n_repeats": int(best_cfg.n_repeats),
+            "mean_max_tanimoto_test_to_train": mean_t,
+            "median_max_tanimoto_test_to_train": med_t,
+        }]).to_csv(outdir / "split_protocol_comparison.csv", index=False)
+
+        print(f"\nRepeated-split artifacts written to {outdir.resolve()}")
+
+        if args.skip_legacy_single_run:
+            print("\n--skip-legacy-single-run set; stopping before the "
+                  "original single-run artifact path.")
+            return
 
     # Split real-reference molecules into calibration train, stack validation, final test.
     idx = np.arange(len(ref_pqr))
@@ -1092,87 +1929,6 @@ def main():
     # ------------------------------------------------------------------
     print("\nTraining piecewise descriptor-split architecture experts...")
 
-    def _line_mae(x, y):
-        x = np.asarray(x, dtype=float)
-        y = np.asarray(y, dtype=float)
-        ok = np.isfinite(x) & np.isfinite(y)
-        x = x[ok]
-        y = y[ok]
-        if len(y) < 50 or np.nanstd(x) < 1e-12:
-            return np.inf
-        A = np.column_stack([x, np.ones(len(x))])
-        coef, *_ = np.linalg.lstsq(A, y, rcond=None)
-        pred = A @ coef
-        return float(np.mean(np.abs(pred - y)))
-
-    def _best_piecewise_split(Xdf, y, candidate_cols, min_leaf=300, max_features=40):
-        y = np.asarray(y, dtype=float)
-
-        # Rank candidate x-features by absolute correlation with the training label.
-        ranked = []
-        for c in candidate_cols:
-            x = pd.to_numeric(Xdf[c], errors="coerce").to_numpy(dtype=float)
-            ok = np.isfinite(x) & np.isfinite(y)
-            if ok.sum() < 2 * min_leaf:
-                continue
-            if np.nanstd(x[ok]) < 1e-12:
-                continue
-            corr = np.corrcoef(x[ok], y[ok])[0, 1]
-            if np.isfinite(corr):
-                ranked.append((c, abs(corr), corr))
-
-        ranked = sorted(ranked, key=lambda z: z[1], reverse=True)[:max_features]
-
-        best = None
-
-        for c, abs_corr, corr in ranked:
-            x = pd.to_numeric(Xdf[c], errors="coerce").to_numpy(dtype=float)
-            ok = np.isfinite(x) & np.isfinite(y)
-            x_ok = x[ok]
-            y_ok = y[ok]
-
-            if len(y_ok) < 2 * min_leaf:
-                continue
-
-            base_mae = _line_mae(x_ok, y_ok)
-
-            # Candidate breakpoints between the 20th and 80th percentiles.
-            qs = np.linspace(0.20, 0.80, 25)
-            cuts = np.unique(np.quantile(x_ok, qs))
-
-            for cut in cuts:
-                left = x_ok <= cut
-                right = ~left
-
-                if left.sum() < min_leaf or right.sum() < min_leaf:
-                    continue
-
-                mae_left = _line_mae(x_ok[left], y_ok[left])
-                mae_right = _line_mae(x_ok[right], y_ok[right])
-
-                if not np.isfinite(mae_left) or not np.isfinite(mae_right):
-                    continue
-
-                piece_mae = (left.sum() * mae_left + right.sum() * mae_right) / len(y_ok)
-                improvement = base_mae - piece_mae
-
-                rec = {
-                    "feature": c,
-                    "corr": float(corr),
-                    "abs_corr": float(abs_corr),
-                    "split_value": float(cut),
-                    "single_line_mae": float(base_mae),
-                    "piecewise_line_mae": float(piece_mae),
-                    "improvement": float(improvement),
-                    "left_n": int(left.sum()),
-                    "right_n": int(right.sum()),
-                }
-
-                if best is None or rec["improvement"] > best["improvement"]:
-                    best = rec
-
-        return best
-
     piece_v = np.zeros(len(ref_val))
     piece_t = np.zeros(len(ref_test))
 
@@ -1181,6 +1937,7 @@ def main():
     piece_t[:] = pred_t["domain_expert"]
 
     piece_rows = []
+    piecewise_models = {}
 
     for domain in sorted(train_pool["domain"].unique()):
         mtr = train_domains == domain
@@ -1225,12 +1982,21 @@ def main():
         piece_rows.append(split)
 
         # Train branch experts.
-        left_model = et(args.seed + 700 + (abs(hash(domain + feature + 'L')) % 10000), n=500)
-        right_model = et(args.seed + 800 + (abs(hash(domain + feature + 'R')) % 10000), n=500)
+        # Deterministic across processes. Python salts str hashes per process
+        # unless PYTHONHASHSEED is fixed, so builtin hash() made branch experts
+        # irreproducible between runs. crc32 is stable everywhere.
+        left_model = et(args.seed + 700 + stable_seed(domain + feature + "L"), n=500)
+        right_model = et(args.seed + 800 + stable_seed(domain + feature + "R"), n=500)
 
         X_domain = Xtrain[mtr]
         left_model.fit(X_domain[left_train], y_domain[left_train])
         right_model.fit(X_domain[right_train], y_domain[right_train])
+
+        # Retained so the external QMugs evaluation can route through the
+        # piecewise branches too. The external block runs earlier in the
+        # script, when these models do not yet exist, so the piecewise
+        # external numbers are computed after this loop.
+        piecewise_models[domain] = (feature, cut, left_model, right_model)
 
         # Route validation molecules in this domain.
         if mv.any():
@@ -1315,6 +2081,73 @@ def main():
             print(f"Saved piecewise split figure to: {outdir / 'figure_piecewise_descriptor_splits.png'}")
     except Exception as exc:
         print(f"WARNING: Could not generate piecewise split figure: {exc}")
+
+    # ------------------------------------------------------------------
+    # External QMugs evaluation for the piecewise architecture.
+    #
+    # The main external block runs before the piecewise experts exist, so it
+    # can only score the global and domain models. rCEG is the piecewise
+    # architecture, so its external numbers are computed here and merged into
+    # the same metrics file.
+    # ------------------------------------------------------------------
+    if external_test is not None and piecewise_models:
+        from sklearn.model_selection import KFold as _KFold
+
+        ext_piece = ext_domain.copy()
+        ext_domains_p = external_test["domain"].to_numpy()
+        for domain, (feature, cut, lm, rm) in piecewise_models.items():
+            mask = ext_domains_p == domain
+            if not mask.any():
+                continue
+            idx = np.where(mask)[0]
+            xv = pd.to_numeric(external_test.loc[mask, feature],
+                               errors="coerce").to_numpy(dtype=float)
+            lsel, rsel = xv <= cut, xv > cut
+            if lsel.any():
+                ext_piece[idx[lsel]] = lm.predict(Xext[idx[lsel]])
+            if rsel.any():
+                ext_piece[idx[rsel]] = rm.predict(Xext[idx[rsel]])
+
+        aligned_p = np.zeros(len(ext_piece), dtype=float)
+        for fit_idx, eval_idx in _KFold(n_splits=5, shuffle=True,
+                                        random_state=args.seed).split(ext_piece):
+            off = np.median(yext[fit_idx] - ext_piece[fit_idx])
+            aligned_p[eval_idx] = ext_piece[eval_idx] + off
+
+        rows_p = [
+            {"evaluation": "strict_frozen_external", "model": "piecewise_split",
+             "mae": float(mean_absolute_error(yext, ext_piece)),
+             "rmse": float(np.sqrt(np.mean((yext - ext_piece) ** 2))),
+             "r2": float(r2_score(yext, ext_piece)), "n": int(len(yext))},
+            {"evaluation": "five_fold_crossfit_offset_aligned",
+             "model": "piecewise_split",
+             "mae": float(mean_absolute_error(yext, aligned_p)),
+             "rmse": float(np.sqrt(np.mean((yext - aligned_p) ** 2))),
+             "r2": float(r2_score(yext, aligned_p)), "n": int(len(yext))},
+        ]
+        mpath = outdir / "qmugs_external_metrics.csv"
+        prev = pd.read_csv(mpath) if mpath.exists() else pd.DataFrame()
+        prev = prev[prev["model"] != "piecewise_split"] if len(prev) else prev
+        pd.concat([prev, pd.DataFrame(rows_p)], ignore_index=True).to_csv(
+            mpath, index=False)
+
+        per_dom = []
+        for domain in sorted(set(ext_domains_p)):
+            m = ext_domains_p == domain
+            per_dom.append({
+                "domain": domain, "n": int(m.sum()),
+                "mae_piecewise_split": float(
+                    np.mean(np.abs(ext_piece[m] - yext[m]))),
+                "mae_piecewise_offset_aligned": float(
+                    np.mean(np.abs(aligned_p[m] - yext[m]))),
+            })
+        pd.DataFrame(per_dom).to_csv(
+            outdir / "qmugs_external_mae_by_domain_piecewise.csv", index=False)
+
+        print(f"\nQMugs external, piecewise_split (rCEG): "
+              f"raw MAE {rows_p[0]['mae']:.4f}, "
+              f"offset-aligned {rows_p[1]['mae']:.4f} "
+              f"(R2 {rows_p[1]['r2']:.4f})")
 
     # Stacker trained only on stack-validation real reference labels.
     names = list(pred_v.keys())
@@ -1442,7 +2275,11 @@ def main():
             "global_rf": g_rf,
             "stacker": stacker,
             "feature_columns": feat_cols,
-            "regime_edges": edges,
+            # "regime_edges" was dropped when the calibrated-gap regime split
+            # was replaced by the piecewise descriptor split; `edges` no longer
+            # exists and referencing it raised NameError under --save-models.
+            "piecewise_branches": piece_rows,
+            "domain_models": sorted(domain_models.keys()),
         }, outdir / "full_domain_moe_model_bundle.joblib")
 
     print(f"\nSaved outputs to: {outdir.resolve()}")

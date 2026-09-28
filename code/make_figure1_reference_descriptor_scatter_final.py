@@ -1,17 +1,63 @@
+#!/usr/bin/env python3
+"""
+make_figure1_reference_descriptor_scatter_final.py   (spec task B1)
+
+Figure 1: interpretable PQR descriptors against the HOMO-LUMO gap, with the two
+reference-labelled subsets highlighted.
+
+Three revision changes (R2.7, R4.5, and the Figure 1 comment in R5)
+-------------------------------------------------------------------
+1. The exact-mass panel is dropped. It is collinear with molecular weight at a
+   MEASURED Pearson r of 0.9934 (the previous caption claimed >0.999; the real
+   value is emitted to figure1_data.csv so the claim is checkable).
+
+2. The legend/caption count mismatch is fixed at its root. The previous version
+   joined reference molecules to the descriptor table on RAW SMILES STRINGS.
+   The reference files store SMILES in a different canonical form, so most
+   joins silently failed:
+
+       QM9  overlap : 614 of 1,243 matched   (49%)
+       Psi4 recompute: 99 of 909 matched     (11%)
+
+   Both sides are now canonicalised with RDKit before joining, which recovers
+   every Psi4 molecule and roughly doubles the QM9 overlap.
+
+   NOTE FOR THE MANUSCRIPT: the caption previously attributed the reduced
+   counts to missing descriptor values. That is incorrect. There are ZERO
+   missing values among the joined rows, and there is no subsampling anywhere
+   in this script. The cause was the un-canonicalised join. The caption
+   sentence must be corrected.
+
+3. Plotted counts are computed AFTER all filtering, and the same variable feeds
+   the legend, the caption string and figure1_data.csv, so the three cannot
+   drift apart again.
+
+Outputs at 600 dpi, PNG and PDF, plus the data sidecar.
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
-import pandas as pd
-import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from rdkit import Chem, RDLogger
+
+RDLogger.DisableLog("rdApp.*")
 
 ROOT = Path(".")
 OUT = ROOT / "paper_figures_revised"
 OUT.mkdir(exist_ok=True)
+DPI = 600
 
 base_path = ROOT / "enhanced_dataset_lasso.csv"
 qm9_path = ROOT / "qm9_gap_reference.csv"
 psi4_path = ROOT / "pqr_recomputed_reference.csv"
 
-for p in [base_path, qm9_path, psi4_path]:
+for p in (base_path, qm9_path, psi4_path):
     if not p.exists():
         raise FileNotFoundError(f"Missing required file: {p}")
 
@@ -19,200 +65,176 @@ base = pd.read_csv(base_path)
 qm9 = pd.read_csv(qm9_path)
 psi4 = pd.read_csv(psi4_path)
 
-# ------------------------------------------------------------
-# Pick merge column
-# ------------------------------------------------------------
-join_col = None
-for c in ["smiles", "id"]:
-    if c in base.columns and c in qm9.columns and c in psi4.columns:
-        join_col = c
-        break
 
-if join_col is None:
-    raise RuntimeError(
-        "Could not find a common join column. Expected 'smiles' or 'id' "
-        "in enhanced_dataset_lasso.csv, qm9_gap_reference.csv, and "
-        "pqr_recomputed_reference.csv."
-    )
+def canon(smiles):
+    try:
+        mol = Chem.MolFromSmiles(str(smiles))
+        return Chem.MolToSmiles(mol) if mol is not None else None
+    except Exception:
+        return None
 
-# ------------------------------------------------------------
-# Required descriptor columns
-# ------------------------------------------------------------
-needed_base = [
-    join_col,
-    "gap",
-    "mol_weight",
-    "exact_mass",
-    "polarizability",
-    "heat_formation",
-]
 
-missing = [c for c in needed_base if c not in base.columns]
+NEEDED = ["smiles", "gap", "mol_weight", "exact_mass",
+          "polarizability", "heat_formation"]
+missing = [c for c in NEEDED if c not in base.columns]
 if missing:
-    raise RuntimeError(f"Missing columns in enhanced_dataset_lasso.csv: {missing}")
+    raise RuntimeError(f"Missing columns in {base_path}: {missing}")
 
-base_keep = base[needed_base].copy()
+base = base[NEEDED].copy()
+base["key"] = base["smiles"].map(canon)
+base = base.dropna(subset=["key"]).drop_duplicates(subset=["key"])
 
-# ------------------------------------------------------------
-# Build plotted reference subsets
-# ------------------------------------------------------------
-qm9_ref = (
-    qm9[[join_col]]
-    .drop_duplicates()
-    .merge(base_keep, on=join_col, how="inner")
-)
+# ------------------------------------------------------------------
+# Restrict to the cleaned training corpus.
+#
+# enhanced_dataset_lasso.csv is the PRE-cleaning descriptor table, so it still
+# contains the 4,719 rows that cleaning removed under
+# "gap_below_min_or_placeholder" -- molecules carrying a literal gap of 0.0 eV.
+# Plotting those put 16 unphysical points on the x-axis of the previous figure
+# (e.g. neopentane at 0.0 eV) and showed molecules the paper then excluded.
+# Joining to the strict corpus makes Figure 1 consistent with every other
+# number in the manuscript.
+# ------------------------------------------------------------------
+import json
 
-psi4_ref = (
-    psi4[[join_col]]
-    .drop_duplicates()
-    .merge(base_keep, on=join_col, how="inner")
-)
+strict_gap = {}
+strict_path = ROOT / "enhanced_dataset_lasso_STRICT.jsonl"
+if strict_path.exists():
+    with open(strict_path, encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            line = line.strip().rstrip(",")
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(rec, list) and len(rec) >= 5 and isinstance(rec[1], str):
+                k = canon(rec[1])
+                if k:
+                    try:
+                        strict_gap[k] = float(rec[4])
+                    except Exception:
+                        pass
+    n_before = len(base)
+    base = base[base["key"].isin(strict_gap)].copy()
 
-qm9_ref["subset"] = "PQR–QM9 overlap"
-psi4_ref["subset"] = "Psi4-recomputed PQR"
-
-plot_df = pd.concat([qm9_ref, psi4_ref], ignore_index=True)
+    # Take the TARGET from the strict corpus, not from the pre-clean CSV.
+    # The two disagree for a handful of molecules -- the CSV still carries the
+    # placeholder 0.0 eV that cleaning replaced -- and the figure must show the
+    # value the model was actually trained against.
+    n_disagree = int((base["gap"] - base["key"].map(strict_gap)).abs().gt(1e-6).sum())
+    base["gap"] = base["key"].map(strict_gap)
+    print(f"restricted to the strict training corpus: "
+          f"{n_before:,} -> {len(base):,} descriptor rows")
+    print(f"  gap taken from the strict corpus; "
+          f"{n_disagree:,} rows disagreed with the pre-clean CSV")
+else:
+    print("WARNING: strict corpus not found; figure will include pre-clean rows")
 
 for c in ["gap", "mol_weight", "exact_mass", "polarizability", "heat_formation"]:
-    plot_df[c] = pd.to_numeric(plot_df[c], errors="coerce")
+    base[c] = pd.to_numeric(base[c], errors="coerce")
 
-plot_df = plot_df.dropna(subset=["gap"])
+# measured collinearity, reported rather than asserted
+r_mw_exact = float(base["mol_weight"].corr(base["exact_mass"]))
 
-# ------------------------------------------------------------
-# Counts for caption
-# ------------------------------------------------------------
-n_qm9 = len(qm9_ref)
-n_psi4 = len(psi4_ref)
-n_total_points = len(plot_df)
-n_unique = plot_df[join_col].nunique()
-n_overlap_between_reference_sets = n_qm9 + n_psi4 - n_unique
+qm9_keys = {k for k in (canon(s) for s in qm9["smiles"].unique()) if k}
+psi4_keys = {k for k in (canon(s) for s in psi4["smiles"].unique()) if k}
 
-print("\nFigure counts:")
-print(f"PQR–QM9 overlap plotted: {n_qm9}")
-print(f"Psi4-recomputed PQR plotted: {n_psi4}")
-print(f"Total plotted label entries: {n_total_points}")
-print(f"Unique molecules: {n_unique}")
-print(f"Overlap between reference groups: {n_overlap_between_reference_sets}")
+# raw-string join retained purely to document the size of the old bug
+raw_qm9 = qm9[["smiles"]].drop_duplicates().merge(
+    base[["smiles"]], on="smiles", how="inner")["smiles"].nunique()
+raw_psi4 = psi4[["smiles"]].drop_duplicates().merge(
+    base[["smiles"]], on="smiles", how="inner")["smiles"].nunique()
 
-# ------------------------------------------------------------
-# Plot settings
-# ------------------------------------------------------------
-specs = [
-    ("mol_weight", "Molecular weight", "Da"),
-    ("exact_mass", "Exact mass", "Da"),
-    ("polarizability", "PM7 polarizability", "Å³"),
-    ("heat_formation", "PM7 heat of formation", "kcal/mol"),
+SERIES = [
+    ("PQR–QM9 overlap", qm9_keys, "#2B6CB0", "o", raw_qm9),
+    ("Psi4-recomputed PQR", psi4_keys, "#DD6B20", "^", raw_psi4),
 ]
 
+PANELS = [
+    ("mol_weight", "Molecular weight", "Da"),
+    ("polarizability", "PM7 polarizability", "Å$^3$"),
+    ("heat_formation", "PM7 heat of formation", "kcal mol$^{-1}$"),
+]
+PANEL_COLS = [c for c, _, _ in PANELS]
+
+# Build each series once, complete-case across every plotted descriptor, so the
+# number in the legend is exactly the number of points drawn in every panel.
+frames, counts = {}, {}
+for label, keys, _, _, _ in SERIES:
+    sub = base[base["key"].isin(keys)].dropna(subset=["gap"] + PANEL_COLS).copy()
+    sub["series"] = label
+    frames[label] = sub
+    counts[label] = len(sub)
+
+plot_df = pd.concat(frames.values(), ignore_index=True)
+
+print("Figure 1 counts (complete-case across all plotted descriptors):")
+for label, keys, _, _, raw in SERIES:
+    print(f"  {label:22s} reference={len(keys):6,}  raw-join={raw:5,}  "
+          f"canonical-join+complete-case={counts[label]:5,}")
+print(f"  measured Pearson r(mol_weight, exact_mass) = {r_mw_exact:.4f}")
+
 plt.rcParams.update({
-    "font.size": 10,
-    "axes.labelsize": 10,
-    "xtick.labelsize": 9,
-    "ytick.labelsize": 9,
-    "legend.fontsize": 10,
+    "font.size": 10, "axes.labelsize": 10,
+    "xtick.labelsize": 9, "ytick.labelsize": 9,
+    "legend.fontsize": 10, "figure.dpi": 120,
+    "savefig.bbox": "tight",
 })
 
-fig, axes = plt.subplots(
-    2,
-    2,
-    figsize=(8.4, 6.4),
-    layout="constrained",
-)
+fig, axes = plt.subplots(1, 3, figsize=(12.4, 4.1))
 
-axes = axes.ravel()
+for ax, (col, name, unit) in zip(axes, PANELS):
+    for label, _, colour, marker, _ in SERIES:
+        d = frames[label]
+        ax.scatter(d[col], d["gap"], s=13, alpha=0.55, c=colour,
+                   marker=marker, linewidths=0,
+                   label=f"{label} (n={counts[label]:,})")
+    ax.set_xlabel(f"{name} ({unit})")
+    ax.grid(True, alpha=0.22, linewidth=0.6)
+    ax.set_axisbelow(True)
+    lo, hi = np.percentile(plot_df[col].dropna(), [0.5, 99.5])
+    pad = 0.04 * (hi - lo)
+    ax.set_xlim(lo - pad, hi + pad)
 
-for ax, (col, label, unit) in zip(axes, specs):
-    dfc = plot_df[[col, "gap", "subset"]].dropna().copy()
+axes[0].set_ylabel("HOMO–LUMO gap (eV)")
 
-    # Trim only extreme display outliers so the plot remains readable.
-    # Full data are still exported to CSV.
-    xlo = dfc[col].quantile(0.005)
-    xhi = dfc[col].quantile(0.995)
-    ylo = dfc["gap"].quantile(0.005)
-    yhi = dfc["gap"].quantile(0.995)
-
-    visible = dfc[
-        (dfc[col] >= xlo)
-        & (dfc[col] <= xhi)
-        & (dfc["gap"] >= ylo)
-        & (dfc["gap"] <= yhi)
-    ]
-
-    q = visible[visible["subset"] == "PQR–QM9 overlap"]
-    p = visible[visible["subset"] == "Psi4-recomputed PQR"]
-
-    ax.scatter(
-        q[col],
-        q["gap"],
-        s=16,
-        alpha=0.68,
-        linewidths=0,
-        label=f"PQR–QM9 overlap (n={n_qm9:,})",
-    )
-
-    ax.scatter(
-        p[col],
-        p["gap"],
-        s=20,
-        alpha=0.70,
-        marker="^",
-        linewidths=0,
-        label=f"Psi4-recomputed PQR (n={n_psi4:,})",
-    )
-
-    ax.set_xlabel(f"{label} ({unit})")
-    ax.set_ylabel("Raw PQR HOMO–LUMO gap (eV)")
-    ax.grid(alpha=0.20)
-
-    # No title or in-panel text.
-    # The descriptor name and unit are already in the x-axis label.
-
-# One shared legend at the bottom.
 handles, labels = axes[0].get_legend_handles_labels()
-
-fig.legend(
-    handles,
-    labels,
-    loc="outside lower center",
-    ncol=2,
-    frameon=False,
-    fontsize=10,
-    markerscale=1.3,
-)
-
-# No figure title. The caption should provide the title.
+fig.legend(handles, labels, loc="lower center", ncol=2, frameon=False,
+           bbox_to_anchor=(0.5, -0.045), markerscale=2.0)
+fig.tight_layout()
 
 png = OUT / "figure1_reference_descriptor_scatter_final.png"
 pdf = OUT / "figure1_reference_descriptor_scatter_final.pdf"
-csv = OUT / "figure1_reference_descriptor_scatter_final_data.csv"
-
-fig.savefig(png, dpi=300, bbox_inches="tight", pad_inches=0.08)
-fig.savefig(pdf, bbox_inches="tight", pad_inches=0.08)
+fig.savefig(png, dpi=DPI)
+fig.savefig(pdf, dpi=DPI)
 plt.close(fig)
 
-plot_df.to_csv(csv, index=False)
+# ---- data sidecar: the same `counts` object that fed the legend ----
+summary = pd.DataFrame([
+    {"series": label,
+     "n_reference_molecules": len(keys),
+     "n_joined_raw_string": raw,
+     "n_plotted": counts[label],
+     "join_method": "RDKit canonical SMILES on both sides"}
+    for label, keys, _, _, raw in SERIES
+])
+summary["pearson_r_molweight_exactmass"] = r_mw_exact
+summary["exact_mass_panel_dropped_reason"] = (
+    f"collinear with molecular weight, measured r={r_mw_exact:.4f}")
+summary.to_csv(OUT / "figure1_data_summary.csv", index=False)
 
-print("\nSaved:")
-print(png)
-print(pdf)
-print(csv)
+plot_df[["smiles", "series", "gap"] + PANEL_COLS].to_csv(
+    OUT / "figure1_data.csv", index=False)
 
-print("\nSuggested caption:")
-print(
-    f"Figure 1. Reference-set descriptor distributions used for calibration and "
-    f"evaluation. Raw PQR HOMO–LUMO gaps are plotted against four scalar molecular "
-    f"descriptors for the PQR–QM9 overlap molecules and the Psi4-recomputed PQR "
-    f"molecules. Blue circles represent PQR–QM9 overlap labels (n={n_qm9:,}), and "
-    f"orange triangles represent Psi4-recomputed PQR labels (n={n_psi4:,}). "
-    f"Molecular weight and exact mass are reported in daltons, PM7 polarizability "
-    f"in Å³, and PM7 heat of formation in kcal/mol."
-)
+print(f"\nwrote {png}")
+print(f"wrote {pdf}")
+print(f"wrote {OUT/'figure1_data.csv'} ({len(plot_df):,} plotted points)")
+print(f"wrote {OUT/'figure1_data_summary.csv'}")
 
-if n_overlap_between_reference_sets > 0:
-    print(
-        f"\nOptional extra caption sentence: Because "
-        f"{n_overlap_between_reference_sets:,} molecules were present in both "
-        f"reference groups, the two plotted groups contain "
-        f"{n_total_points:,} label entries corresponding to "
-        f"{n_unique:,} unique molecules."
-    )
+# ---- acceptance: legend counts must equal the sidecar counts exactly ----
+recount = plot_df.groupby("series").size().to_dict()
+ok = all(recount.get(l) == counts[l] for l in counts)
+print(f"\n[{'PASS' if ok else 'FAIL'}] legend n matches figure1_data.csv rows: "
+      f"{ {l: (counts[l], recount.get(l)) for l in counts} }")

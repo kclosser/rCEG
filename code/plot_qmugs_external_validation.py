@@ -1,12 +1,26 @@
 from pathlib import Path
+import argparse
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-RUN = Path("runs/pqr_qmugs_strict_external_LEAK094")
-OUT = RUN / "figures"
+# Sources were hardcoded to runs/pqr_qmugs_strict_external_LEAK094, a
+# superseded run. Spec 0.1 requires every manuscript number to come from the
+# consolidated run, so the path is now a flag defaulting there.
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--run", default="runs/rceg_final_consolidated")
+_ap.add_argument("--out", default="paper_figures_revised")
+_ap.add_argument("--dpi", type=int, default=600)
+_args, _ = _ap.parse_known_args()
+
+RUN = Path(_args.run)
+OUT = Path(_args.out)
 OUT.mkdir(parents=True, exist_ok=True)
+DPI = _args.dpi
+print(f"QMugs figures from {RUN} at {DPI} dpi")
 
 pred = pd.read_csv(RUN / "qmugs_external_predictions.csv")
 ext_metrics = pd.read_csv(RUN / "qmugs_external_metrics.csv")
@@ -111,7 +125,7 @@ plt.grid(True, alpha=0.25)
 plt.tight_layout()
 plt.savefig(
     OUT / "figure_qmugs_predicted_vs_reference.png",
-    dpi=300,
+    dpi=DPI,
     bbox_inches="tight",
 )
 plt.close()
@@ -151,7 +165,7 @@ for i, (_, row) in enumerate(domain.iterrows()):
 plt.tight_layout()
 plt.savefig(
     OUT / "figure_qmugs_mae_by_domain.png",
-    dpi=300,
+    dpi=DPI,
     bbox_inches="tight",
 )
 plt.close()
@@ -197,7 +211,7 @@ for i, value in enumerate(plot_data["mae_ev"]):
 plt.tight_layout()
 plt.savefig(
     OUT / "figure_qmugs_published_context_comparison.png",
-    dpi=300,
+    dpi=DPI,
     bbox_inches="tight",
 )
 plt.close()

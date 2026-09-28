@@ -7,30 +7,27 @@ ROOT = Path(".")
 OUT = ROOT / "paper_figures_revised"
 OUT.mkdir(exist_ok=True)
 
-# Try to find the needed files from either the revised figures folder or runs.
-data_candidates = [
-    OUT / "figure_piecewise_splits_named_axes_data.csv",
-    *ROOT.glob("runs/**/all_pqr_predictions_with_label_source.csv"),
-]
+# ----------------------------------------------------------------------
+# Sources are PINNED to the consolidated run. They used to be discovered by
+# Path.glob(), whose iteration order is arbitrary rather than sorted, and the
+# first candidate was a cached CSV in paper_figures_revised/ that took
+# precedence over any run output. With the scaffold-split run now on disk, the
+# branch file could silently have come from runs/.../split_scaffold/, so the
+# main-text figure would have described a different experiment than the one
+# reported. Spec 0.1 requires a single source of truth; here it is explicit.
+# ----------------------------------------------------------------------
+RUN = ROOT / "runs/rceg_final_consolidated"
+data_path = RUN / "figure_piecewise_plot_data.csv"
+branch_path = RUN / "piecewise_split_architecture_branches.csv"
 
-branch_candidates = [
-    *ROOT.glob("runs/**/piecewise_split_architecture_branches.csv"),
-]
-
-data_path = next((p for p in data_candidates if p.exists()), None)
-branch_path = next((p for p in branch_candidates if p.exists()), None)
-
-if data_path is None:
-    raise FileNotFoundError(
-        "Could not find piecewise plot data. Expected either:\n"
-        "paper_figures_revised/figure_piecewise_splits_named_axes_data.csv\n"
-        "or runs/**/all_pqr_predictions_with_label_source.csv"
-    )
-
-if branch_path is None:
-    raise FileNotFoundError(
-        "Could not find piecewise_split_architecture_branches.csv under runs/."
-    )
+for _p, _what in ((data_path, "all-PQR predictions"),
+                  (branch_path, "piecewise branch table")):
+    if not _p.exists():
+        raise FileNotFoundError(
+            f"{_what} not found at {_p}. This figure is pinned to the "
+            f"consolidated run; run it first rather than pointing the figure "
+            f"at another directory."
+        )
 
 print("Using data:", data_path)
 print("Using branches:", branch_path)
@@ -64,14 +61,54 @@ domain_label = {
     "large_neutral_organic": "Large neutral organic",
 }
 
-# If you eventually recover real descriptor names, replace these labels.
-feature_label = {
-    "x13": "BCUT2D_MWLOW descriptor value",
-    "x15": "MolLogP descriptor value (unitless)",
-    "x47": "Morgan fingerprint feature 80 value",
-    "x260": "LASSO descriptor 256 internal value; name unavailable",
-    "x316": "LASSO descriptor 312 internal value; name unavailable",
+# ----------------------------------------------------------------------
+# Descriptor names are READ from the E4 resolution, never hardcoded.
+#
+# The previous hardcoded map was wrong. Verified by value-matching each
+# stored column against a freshly computed RDKit pool (NaN -> 0, the
+# convention DescriptorPull3.py used):
+#
+#     x13   claimed BCUT2D_MWLOW          actually TPSA
+#     x15   claimed MolLogP               actually HallKierAlpha
+#     x47   claimed Morgan fingerprint 80  actually BCUT2D_MRLOW
+#     x260  claimed "name unavailable"     actually Ipc
+#     x316  claimed "name unavailable"     actually BertzCT
+#
+# Three were misidentified and two were blank, so the main-text figure was
+# labelling its axes with the wrong chemistry.
+# ----------------------------------------------------------------------
+_UNITS = {
+    "TPSA": " (Å$^2$)",
+    "BertzCT": " (complexity index)",
+    "Ipc": " (information content)",
+    "BCUT2D_MRLOW": " (molar-refractivity weighted)",
+    "HallKierAlpha": " (shape correction)",
+    "VSA_EState6": " (EState-weighted surface area)",
 }
+
+_name_map_path = ROOT / "runs/rceg_final_consolidated/piecewise_feature_name_map.csv"
+if not _name_map_path.exists():
+    _name_map_path = OUT / "piecewise_feature_name_map.csv"
+if not _name_map_path.exists():
+    raise FileNotFoundError(
+        "piecewise_feature_name_map.csv not found. Run "
+        "resolve_lasso_feature_names.py first (spec task E4)."
+    )
+
+_nm = pd.read_csv(_name_map_path)
+if _nm["interpretable_label"].astype(str).str.contains(
+        r"LASSO-selected descriptor \d+", regex=True).any():
+    raise RuntimeError(
+        "piecewise_feature_name_map.csv still contains placeholder labels; "
+        "re-run resolve_lasso_feature_names.py."
+    )
+
+feature_label = {
+    str(r["feature"]): f"{r['descriptor_name']}{_UNITS.get(str(r['descriptor_name']), '')}"
+    for _, r in _nm.iterrows()
+}
+print("resolved descriptor names:",
+      ", ".join(f"{k}={v}" for k, v in feature_label.items()))
 
 # Preferred panel order matching your existing figure.
 preferred_order = [
@@ -93,7 +130,7 @@ n = len(branches)
 fig, axes = plt.subplots(
     n,
     1,
-    figsize=(7.2, 10.4),
+    figsize=(8.0, 11.0),
     sharey=False,
 )
 
@@ -182,13 +219,11 @@ for ax, (_, row) in zip(axes, branches.iterrows()):
 
     if improvement is not None and np.isfinite(improvement):
         xlabel = (
-            f"{dlabel}: {flabel}; split threshold = {split_value:.4g}; "
-            f"linear MAE improvement = {improvement:.3f} eV"
+            f"{flabel}    split = {split_value:.4g}    "
+            f"MAE gain = {improvement:.3f} eV"
         )
     else:
-        xlabel = (
-            f"{dlabel}: {flabel}; split threshold = {split_value:.4g}"
-        )
+        xlabel = f"{flabel}    split = {split_value:.4g}"
 
     ax.set_xlabel(xlabel, fontsize=8.5)
     ax.set_ylabel("Reference-aligned gap (eV)", fontsize=8.5)
@@ -219,8 +254,9 @@ fig.tight_layout(h_pad=1.1)
 out_png = OUT / "figure_piecewise_splits_named_best_available.png"
 out_pdf = OUT / "figure_piecewise_splits_named_best_available.pdf"
 
-fig.savefig(out_png, dpi=300, bbox_inches="tight")
-fig.savefig(out_pdf, bbox_inches="tight")
+fig.tight_layout(pad=0.8)
+fig.savefig(out_png, dpi=600, bbox_inches="tight")
+fig.savefig(out_pdf, dpi=600, bbox_inches="tight")
 plt.close(fig)
 
 # Save figure metadata for the paper.
