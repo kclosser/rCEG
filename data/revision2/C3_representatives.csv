@@ -1,0 +1,6 @@
+domain,mol_id,n_heavy,domain_median_heavy,charge,mult
+charged_or_radical,pqr_0166,22,22.0,2,3
+heteroatom_rich_non_qm9,pqr_0399,18,18.0,0,1
+large_neutral_organic,pqr_0502,27,27.0,0,1
+near_qm9_larger_organic,pqr_0845,14,14.0,0,1
+qm9_like_small_organic,pqr_0871,8,8.0,0,1

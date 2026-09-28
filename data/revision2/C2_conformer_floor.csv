@@ -1,0 +1,2 @@
+n_molecules_ge3_conformers,median_conformer_sd_eV,iqr_low,iqr_high,mean,p90,max,median_conformer_count
+9697,0.0763,0.0284,0.1603,0.112,0.2645,1.0708,3

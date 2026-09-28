@@ -1,0 +1,6 @@
+domain,mol_id,n_heavy_atoms,charge,multiplicity,basis,descriptors_ms,semiempirical_gfn2xtb_ms,b3lyp_s,b3lyp_converged,inference_ms,end_to_end_in_pqr_ms,end_to_end_novel_ms,speedup_in_pqr,speedup_novel
+charged_or_radical,pqr_0166,22,2,3,def2-SVP,5.589,26.202,256.21,True,9.496,15.09,41.29,16979,6205
+heteroatom_rich_non_qm9,pqr_0399,18,0,1,def2-SVP,2.94,44.691,42.41,True,9.496,12.44,57.13,3409,742
+large_neutral_organic,pqr_0502,27,0,1,"6-31G(d,p)",4.475,65.304,129.84,True,9.496,13.97,79.27,9294,1638
+near_qm9_larger_organic,pqr_0845,14,0,1,"6-31G(d,p)",2.717,48.322,40.05,True,9.496,12.21,60.54,3280,662
+qm9_like_small_organic,pqr_0871,8,0,1,"6-31G(d,p)",1.744,43.817,10.92,True,9.496,11.24,55.06,972,198

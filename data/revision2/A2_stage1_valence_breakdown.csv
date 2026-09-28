@@ -1,0 +1,7 @@
+element,count,pct_of_stage1,typical_pattern
+N,8795,86.5,"neutral tetravalent nitrogen, e.g. =[N]= or C=[N]=C, written without a formal +1 charge"
+C,1169,11.5,"carbon at valence 5-6, often in metal-chelate or carbene-like depictions"
+(kekulize),73,0.7,aromatic ring that could not be kekulised
+O,68,0.7,trivalent oxygen without charge
+B,45,0.4,tetravalent boron without charge
+Si/Ge/Al,8,0.1,main-group metals exceeding default valence
