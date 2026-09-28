@@ -1,0 +1,2 @@
+n_iterations_fitted,max_iter_requested,early_stopped,best_iteration,val_mae_min,test_mae,production_ref_val_mae,production_ref_test_mae,internal_earlystop_mae_min,seed,source
+700,700,False,700,0.43688700754321713,0.4578823438252228,0.43910374163166715,0.45554503641386934,0.0864978842602848,42,consolidated-run primary split. val_mae_min/test_mae come from the reference-measured warm-start curve that Figure 3 plots. production_* come from the early-stopping model used in the ablation table and agree to within 0.003 eV.

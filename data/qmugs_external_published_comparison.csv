@@ -1,0 +1,6 @@
+benchmark,model,mae_ev,n,comparison_type,directly_comparable
+Internal held-out real-reference test,rCEG chemical-domain expert,0.3273739112644295,425,Internal reference holdout,True
+QMugs strict frozen external transfer,rCEG chemical-domain expert,4.1884304418804446,9753,Unseen molecules; external omegaB97X-D/def2-SVP labels,False
+QMugs cross-fitted offset-aligned transfer,rCEG chemical-domain expert,0.5210315228984856,9753,Secondary diagnostic correcting computational-method offset,False
+Published QMugs test,DelFTa direct learning,0.0529,88000,Published model trained directly on QMugs conformers,False
+Published QMugs test,DelFTa delta learning,0.0473,88000,Published model trained on QMugs with GFN2-xTB baseline,False

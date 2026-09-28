@@ -1,0 +1,15 @@
+measurement,n,unit,median,iqr_low,iqr_high,mean,min,max,hardware,source
+b3lyp_single_point_reference,332,s,119.0,51.0,273.25,238.17168674698794,2.0,4442.0,"cluster (SLURM shared partition, 8 threads/job)",recovered from production recompute psi4 logs
+pm7_semiempirical_novel_molecule,0,s,,,,,,,NOT MEASURED,"UNMEASURED: no MOPAC or OpenBabel on the benchmark machine. This cost is REQUIRED for any molecule not already in PQR, because x0-x4 are PQR-native PM7 quantities (mass, exact mass, dipole, heat of formation, polarizability). Literature PM7 single-point cost for drug-sized molecules is order 1-10 s, but no measured value is claimed here."
+etkdg_embed_plus_uff_relax,100,s,0.010450833127833903,0.004550114332232624,0.030570635164622217,0.025510699164588004,0.0007078328635543585,0.23051320808008313,local,"reference generation only, not inference"
+descriptor_generation_per_molecule,100,ms,3.058686968870461,2.223843534011394,4.383667081128806,3.4408921212889254,1.5114580746740103,12.302250135689974,local,"RDKit descList + 200 Morgan bits, as DescriptorPull3.py"
+descriptor_generation[charged_or_radical],20,ms,3.7021245807409286,2.965031482744962,4.8222707700915635,4.483043670188636,2.225999953225255,12.10129214450717,local,per-domain breakdown
+descriptor_generation[heteroatom_rich_non_qm9],20,ms,3.2759164460003376,2.606593887321651,4.262302070856094,3.4776167012751102,1.8828748725354671,6.123500177636743,local,per-domain breakdown
+descriptor_generation[large_neutral_organic],20,ms,4.763666540384293,4.244593961630017,5.712583544664085,4.980068805161864,3.4630419686436653,7.365875178948045,local,per-domain breakdown
+descriptor_generation[near_qm9_larger_organic],20,ms,2.61345854960382,2.314541779924184,2.901822212152183,2.661447855643928,2.17420794069767,3.3326668199151754,local,per-domain breakdown
+descriptor_generation[qm9_like_small_organic],20,ms,1.8324999837204814,1.7352504655718803,1.9223025301471353,1.8298813491128385,1.5166669618338346,2.0584589801728725,local,per-domain breakdown
+full_training_one_expert,84143,s,110.74026462482288,,,110.74026462482288,110.74026462482288,110.74026462482288,"local, 12 threads","ExtraTrees(700) on 84,143x427; peak RSS 2092 MB (delta +1564 MB). One-time cost; the published architecture trains several such experts."
+inference_single_molecule_latency,100,ms,38.28447894193232,37.10802108980715,39.49519828893244,40.500470369588584,34.21866591088474,140.57279215194285,local,"one row at a time, warm model"
+inference_batched_amortized_per_molecule,20,ms,0.3955291712190956,0.3814186475938186,0.4955691657960415,0.4229164792923257,0.3664608299732208,0.529337499756366,local,"batch of 100, 20 repeats"
+end_to_end_molecule_already_in_pqr,100,ms,42.23372903652489,41.12320864805952,43.59114548424259,42.818594181444496,37.63075009919703,73.17570806480944,local,descriptors + inference; PM7 inputs already available
+end_to_end_novel_molecule,0,ms,,,,,,,PARTIALLY UNMEASURED,"equals PM7 semiempirical cost + 42.2 ms. The descriptor+inference part is measured; the PM7 term is not available on this machine, so no total is claimed."

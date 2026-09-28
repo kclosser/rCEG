@@ -1,0 +1,7 @@
+component,transformation,reason
+ExtraTrees and RandomForest,Median imputation + variance filtering; no scaling,Tree split thresholds are scale invariant
+HistGradientBoosting,Median imputation + variance filtering; no scaling,Tree-based boosting does not require feature scaling
+Linear/Ridge calibration,"Robust, Standard, and Yeo-Johnson variants compared",Scaling and skew correction can affect regularized linear models
+Global Ridge experts,RobustScaler and StandardScaler variants,Provides scaled regularized alternatives to tree experts
+Reference-validated stacker,StandardScaler fitted on validation predictions,Makes Ridge penalties comparable between model outputs
+Applicability-domain distance,Median imputation + RobustScaler,Euclidean distances require comparable feature scales

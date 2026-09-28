@@ -1,0 +1,7 @@
+rule,count
+gap_below_min_or_placeholder,4719
+duplicate_rows_removed,3328
+multi_fragment,2005
+target_percentile_trim,446
+isolated_hydrogen,101
+gap_above_hard_max,10

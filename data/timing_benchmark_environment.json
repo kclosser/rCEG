@@ -1,0 +1,10 @@
+{
+  "cpu": "arm",
+  "cpu_brand": "Apple M4 Pro",
+  "logical_cores": 12,
+  "platform": "macOS-15.3.1-arm64-arm-64bit-Mach-O",
+  "python": "3.14.0",
+  "numpy": "2.5.3",
+  "notes": {},
+  "threading": "sklearn n_jobs=-1 for training; predict is single-threaded"
+}

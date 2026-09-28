@@ -1,0 +1,9 @@
+# Large derived files NOT redistributed
+#
+# These are regenerable from the scripts in code/. SHA256 given so a
+# reviewer can verify a locally regenerated copy matches ours.
+#
+filename,bytes,sha256
+enhanced_dataset_lasso_STRICT.jsonl,265404137,5b17d2d2499ec50e976d5cf01e63e1346bba8df1a224c5548974486857d11240
+enhanced_dataset_lasso_CLEAN.jsonl,267227064,a91b03c6469cc3b71f23fda7c5fb9100758f7b80432c8370bb99e54e1efeb407
+external_validation/qmugs/qmugs_external_reference.csv,1499408,01f0dd51ffa071fd0f989a351ccd9e5baa1165412b37adbb64d1f0b4430aca16

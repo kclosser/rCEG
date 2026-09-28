@@ -1,0 +1,2 @@
+split_mode,best_config,test_mae,test_mae_sd,test_rmse,test_r2,n_test,n_repeats,mean_max_tanimoto_test_to_train,median_max_tanimoto_test_to_train
+random,domain_expert,0.33498577512,0.026471039238417537,0.5619024291400001,0.9332068770099999,424,10,0.4759330894471621,0.45454545454545453

@@ -1,0 +1,15 @@
+rule,count,stage,description,checked
+missing_or_nonstring_smiles,140,1_descriptor_extraction,PQR record had no 'smiles' key or it was not a string,True
+missing_pm7_block,0,1_descriptor_extraction,PQR record had no 'pm7' quantum property block,True
+numeric_coercion_error,0,1_descriptor_extraction,float() raised on a pm7 or mass field,True
+not_a_dict,0,1_descriptor_extraction,raw list element was not a dictionary,True
+missing_descriptor_block,0,1_descriptor_extraction,"DescriptorPull3 computes descriptors inline, so there is no separate descriptor-block field that can be missing; path checked, empty by construction",True
+sanitize_valence_error,10089,1_descriptor_extraction,Tokenised but SanitizeMol raised an atom-valence error,True
+sanitize_kekulize_error,73,1_descriptor_extraction,Tokenised but SanitizeMol could not kekulise the structure,True
+gap_below_min_or_placeholder,4719,2_clean_pass,itemised by pqr_data_cleaner.py,True
+duplicate_rows_removed,3328,2_clean_pass,itemised by pqr_data_cleaner.py,True
+multi_fragment,2005,2_clean_pass,itemised by pqr_data_cleaner.py,True
+target_percentile_trim,446,2_clean_pass,itemised by pqr_data_cleaner.py,True
+isolated_hydrogen,101,2_clean_pass,itemised by pqr_data_cleaner.py,True
+gap_above_hard_max,10,2_clean_pass,itemised by pqr_data_cleaner.py,True
+conflicting_duplicate_discard,1012,3_strict_pass,STRICT drops duplicate SMILES with conflicting gap labels instead of median-merging them as the CLEAN pass does,True

@@ -1,0 +1,10 @@
+axis,bin,n,rule,threshold,observed_min,observed_max
+applicability_domain,high_in_domain,60653,1-NN Euclidean distance to the calibration set in RobustScaler space,<= 90th pct of held-out reference distance,0.0,20.0772
+applicability_domain,medium_near_domain,10588,1-NN Euclidean distance to the calibration set in RobustScaler space,<= 97.5th pct,20.0782,30.4639
+applicability_domain,low_out_of_domain,3149,1-NN Euclidean distance to the calibration set in RobustScaler space,> 97.5th pct,30.4655,122401.1719
+cycle_consistency,high_cycle_consistency,10684,|inverse-reconstructed pqr_gap - original pqr_gap|,cycle_error <= 0.20 eV,0.0,0.2
+cycle_consistency,medium_cycle_consistency,12186,|inverse-reconstructed pqr_gap - original pqr_gap|,0.20 < cycle_error <= 0.50 eV,0.2,0.5
+cycle_consistency,low_cycle_consistency,51520,|inverse-reconstructed pqr_gap - original pqr_gap|,cycle_error > 0.50 eV,0.5001,11.1183
+final_combined,high_confidence,9451,pessimistic combination: worst of the two axes wins,low if either axis is low; medium if either is medium; else high,,
+final_combined,medium_confidence,12755,pessimistic combination: worst of the two axes wins,low if either axis is low; medium if either is medium; else high,,
+final_combined,low_confidence,52184,pessimistic combination: worst of the two axes wins,low if either axis is low; medium if either is medium; else high,,

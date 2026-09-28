@@ -1,0 +1,2 @@
+split_mode,best_config,test_mae,test_mae_sd,test_rmse,test_r2,n_test,n_repeats,mean_max_tanimoto_test_to_train,median_max_tanimoto_test_to_train
+scaffold,domain_expert,0.3597422879421747,0.025076726064892824,0.5696771121926341,0.9249038147173586,408,10,0.39945489976946863,0.34698996655518394

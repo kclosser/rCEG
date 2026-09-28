@@ -1,0 +1,6 @@
+domain,mean_abs_delta_gap
+charged_or_radical,0.49703339070327257
+heteroatom_rich_non_qm9,0.30466883762741137
+large_neutral_organic,0.21058382316218904
+near_qm9_larger_organic,0.3548303355956731
+qm9_like_small_organic,0.7444071146733927

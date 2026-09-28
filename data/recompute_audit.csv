@@ -1,0 +1,7 @@
+domain,n_targeted,n_converged,n_failed,n_failure_records,n_records_that_later_converged,n_failed_with_no_record,fraction_of_domain_population,failure_mode
+charged_or_radical,250,249,1,2,1,0,,manually_marked_failed=1
+heteroatom_rich_non_qm9,249,233,16,64,48,0,,disk_or_scratch_exhausted=13; other=3
+large_neutral_organic,248,227,21,18,1,4,,disk_or_scratch_exhausted=17
+near_qm9_larger_organic,100,100,0,0,0,0,,none
+qm9_like_small_organic,100,100,0,0,0,0,,none
+TOTAL,947,909,38,84,50,4,,disk_or_scratch_exhausted=30; manually_marked_failed=1; other=3
