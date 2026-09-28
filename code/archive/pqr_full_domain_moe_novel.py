@@ -1,0 +1,1012 @@
+#!/usr/bin/env python3
+"""
+pqr_full_domain_moe.py
+
+Full PQR domain-aware calibrated mixture-of-experts model.
+
+Purpose:
+- Train on the full PQR dataset, not only QM9-overlap molecules.
+- Use QM9 overlap and optional recomputed PQR reference labels as real anchors.
+- Use calibrated pseudo-labels for the rest of PQR.
+- Evaluate honestly only on held-out real reference labels.
+- Report MAE by domain, confidence, and label source.
+
+No HOMO/LUMO leakage:
+- pqr[5] and pqr[6] are never used as features.
+- pqr_gap is used only for calibration/teacher pseudo-label generation.
+- Final predictors use molecular features only, not pqr_gap or calibrated_gap.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from pathlib import Path
+from collections import Counter
+
+import joblib
+import numpy as np
+import pandas as pd
+
+from rdkit import Chem
+from rdkit.Chem import Descriptors, Crippen, Lipinski, rdMolDescriptors
+
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor, HistGradientBoostingRegressor
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import RidgeCV, LinearRegression
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import RobustScaler
+
+
+def fnum(x):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else np.nan
+    except Exception:
+        return np.nan
+
+
+def canon(smiles, isomeric=True):
+    try:
+        mol = Chem.MolFromSmiles(str(smiles), sanitize=True)
+        if mol is None:
+            return None
+        return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=isomeric)
+    except Exception:
+        return None
+
+
+def classify_domain(mol):
+    atoms = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    allowed_qm9 = {1, 6, 7, 8, 9}
+    allowed = all(a in allowed_qm9 for a in atoms)
+    has_carbon = any(a == 6 for a in atoms)
+    heavy = mol.GetNumHeavyAtoms()
+    charge = sum(a.GetFormalCharge() for a in mol.GetAtoms())
+    radicals = sum(a.GetNumRadicalElectrons() for a in mol.GetAtoms())
+    single = len(Chem.GetMolFrags(mol)) == 1
+
+    if allowed and has_carbon and single and charge == 0 and radicals == 0 and heavy <= 9:
+        return "qm9_like_small_organic"
+    if allowed and has_carbon and single and charge == 0 and radicals == 0 and heavy <= 20:
+        return "near_qm9_larger_organic"
+    if allowed and has_carbon and single and charge == 0:
+        return "large_neutral_organic"
+    if charge != 0 or radicals != 0:
+        return "charged_or_radical"
+    return "heteroatom_rich_non_qm9"
+
+
+def rdkit_features(mol):
+    atoms = list(mol.GetAtoms())
+    bonds = list(mol.GetBonds())
+    return [
+        Descriptors.MolWt(mol),
+        Descriptors.ExactMolWt(mol),
+        Descriptors.HeavyAtomMolWt(mol),
+        Descriptors.NumValenceElectrons(mol),
+        mol.GetNumHeavyAtoms(),
+        rdMolDescriptors.CalcNumRings(mol),
+        rdMolDescriptors.CalcNumAromaticRings(mol),
+        rdMolDescriptors.CalcNumAliphaticRings(mol),
+        rdMolDescriptors.CalcNumSaturatedRings(mol),
+        rdMolDescriptors.CalcNumHBA(mol),
+        rdMolDescriptors.CalcNumHBD(mol),
+        rdMolDescriptors.CalcTPSA(mol),
+        Crippen.MolLogP(mol),
+        Crippen.MolMR(mol),
+        Lipinski.NumRotatableBonds(mol),
+        Lipinski.NumHeteroatoms(mol),
+        Lipinski.FractionCSP3(mol),
+        sum(a.GetIsAromatic() for a in atoms),
+        sum(b.GetIsAromatic() for b in bonds),
+        sum(b.GetBondTypeAsDouble() == 2 for b in bonds),
+        sum(b.GetBondTypeAsDouble() == 3 for b in bonds),
+        sum(a.GetAtomicNum() == 6 for a in atoms),
+        sum(a.GetAtomicNum() == 7 for a in atoms),
+        sum(a.GetAtomicNum() == 8 for a in atoms),
+        sum(a.GetAtomicNum() == 9 for a in atoms),
+        sum(a.GetAtomicNum() == 16 for a in atoms),
+        sum(a.GetAtomicNum() == 17 for a in atoms),
+        sum(a.GetAtomicNum() == 35 for a in atoms),
+        sum(a.GetAtomicNum() == 53 for a in atoms),
+        sum(a.GetAtomicNum() == 15 for a in atoms),
+        sum(a.GetAtomicNum() == 5 for a in atoms),
+    ]
+
+
+def bond_step_features(mol):
+    try:
+        dm = Chem.GetDistanceMatrix(mol).astype(float)
+        upper = dm[np.triu_indices_from(dm, k=1)]
+        upper = upper[np.isfinite(upper)]
+        if len(upper) == 0:
+            return [0.0] * 16
+
+        out = [
+            np.max(upper),
+            np.mean(upper),
+            np.std(upper),
+            np.median(upper),
+            np.percentile(upper, 25),
+            np.percentile(upper, 75),
+        ]
+
+        for d in range(1, 11):
+            out.append(float(np.sum(upper == d)) / len(upper))
+
+        return out
+    except Exception:
+        return [np.nan] * 16
+
+
+def load_pqr(path):
+    rows = []
+    feats = []
+    audit_rows = []
+    drops = Counter()
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip().rstrip(",")
+            if not line:
+                continue
+
+            e = json.loads(line)
+            if not (isinstance(e, list) and len(e) >= 5 and isinstance(e[1], str)):
+                drops["bad_shape"] += 1
+                continue
+
+            smiles_raw = e[1]
+            pqr_gap = fnum(e[4])
+            pqr = e[2] if isinstance(e[2], list) else []
+            lasso = e[3] if isinstance(e[3], list) else []
+
+            if not math.isfinite(pqr_gap):
+                drops["bad_gap"] += 1
+                continue
+
+            mol = Chem.MolFromSmiles(smiles_raw, sanitize=True)
+            if mol is None:
+                drops["bad_smiles"] += 1
+                continue
+
+            smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+
+            # Non-leakage features only:
+            # pqr[:5] excludes pqr[5]=HOMO and pqr[6]=LUMO.
+            x = []
+            x.extend([fnum(v) for v in pqr[:5]])
+            x.extend([fnum(v) for v in lasso])
+            x.extend(rdkit_features(mol))
+            x.extend(bond_step_features(mol))
+
+            arr = np.array(x, dtype=np.float64)
+            arr[~np.isfinite(arr)] = np.nan
+            arr = np.clip(arr, -1e6, 1e6)
+
+            rows.append({
+                "smiles": smiles,
+                "pqr_gap": pqr_gap,
+                "domain": classify_domain(mol),
+                "heavy_atoms": mol.GetNumHeavyAtoms(),
+            })
+            feats.append(arr.astype(np.float32))
+
+            if isinstance(pqr, list) and len(pqr) >= 7:
+                audit_rows.append({
+                    "smiles": smiles,
+                    "gap": pqr_gap,
+                    "homo": fnum(pqr[5]),
+                    "lumo": fnum(pqr[6]),
+                    "lumo_minus_homo": fnum(pqr[6]) - fnum(pqr[5]),
+                })
+
+    max_len = max(len(x) for x in feats)
+    X = np.full((len(feats), max_len), np.nan, dtype=np.float32)
+    for i, x in enumerate(feats):
+        X[i, :len(x)] = x
+
+    df = pd.DataFrame(rows)
+    Xdf = pd.DataFrame(X, columns=[f"x{i}" for i in range(X.shape[1])])
+    df = pd.concat([df, Xdf], axis=1)
+
+    feat_cols = [c for c in df.columns if c.startswith("x")]
+
+    agg = {"pqr_gap": "median", "domain": "first", "heavy_atoms": "median"}
+    for c in feat_cols:
+        agg[c] = "median"
+
+    df = df.groupby("smiles", as_index=False).agg(agg)
+    audit = pd.DataFrame(audit_rows).drop_duplicates("smiles")
+
+    print(f"PQR unique molecules: {len(df):,}")
+    print(f"PQR drops: {dict(drops)}")
+    print("PQR domains:")
+    print(df["domain"].value_counts().to_string())
+
+    return df, audit
+
+
+def load_reference(path, source_name):
+    ref = pd.read_csv(path)
+    if "smiles" not in ref.columns:
+        raise ValueError(f"{path} must contain a smiles column.")
+
+    gap_col = None
+    for c in ["gap", "ref_gap", "homo_lumo_gap", "HOMO_LUMO_gap", "deltaE", "DeltaEHL", "gap_ev"]:
+        if c in ref.columns:
+            gap_col = c
+            break
+
+    if gap_col is None:
+        raise ValueError(f"{path} must contain a gap/ref_gap column.")
+
+    rows = []
+    for _, r in ref.iterrows():
+        smi = canon(r["smiles"], isomeric=True)
+        g = fnum(r[gap_col])
+        if smi is not None and math.isfinite(g):
+            rows.append({"smiles": smi, "ref_gap": g, "ref_source": source_name})
+
+    out = pd.DataFrame(rows)
+    out = out.groupby("smiles", as_index=False).agg({
+        "ref_gap": "median",
+        "ref_source": "first",
+    })
+
+    print(f"Reference {source_name}: {len(out):,} unique molecules")
+    return out
+
+
+def leakage_filter(df, audit, threshold, outdir):
+    feat_cols = [c for c in df.columns if c.startswith("x")]
+    merged = df[["smiles"] + feat_cols].merge(audit, on="smiles", how="inner")
+
+    targets = ["gap", "homo", "lumo", "lumo_minus_homo"]
+    bad = set()
+    records = []
+
+    for c in feat_cols:
+        vals = pd.to_numeric(merged[c], errors="coerce")
+        if vals.notna().sum() < 100:
+            continue
+
+        for t in targets:
+            corr = vals.corr(merged[t])
+            ac = abs(corr) if pd.notna(corr) else np.nan
+            records.append({"feature": c, "target": t, "abs_corr": ac, "corr": corr})
+            if pd.notna(ac) and ac >= threshold:
+                bad.add(c)
+
+    audit_df = pd.DataFrame(records).sort_values("abs_corr", ascending=False)
+    audit_df.to_csv(outdir / "feature_leakage_audit.csv", index=False)
+
+    keep = [c for c in feat_cols if c not in bad]
+    print(f"Leakage filter dropped {len(bad)} features at abs_corr >= {threshold}")
+    print(audit_df.head(20).to_string(index=False))
+    return keep
+
+
+def pipe(model, scale=True):
+    steps = [
+        ("imp", SimpleImputer(strategy="median")),
+        ("var", VarianceThreshold(1e-12)),
+    ]
+    if scale:
+        steps.append(("scale", RobustScaler(with_centering=False)))
+    steps.append(("model", model))
+    return Pipeline(steps)
+
+
+def et(seed, n=500):
+    return pipe(ExtraTreesRegressor(
+        n_estimators=n,
+        max_features=0.35,
+        min_samples_leaf=1,
+        random_state=seed,
+        n_jobs=-1,
+    ))
+
+
+def rf(seed, n=400):
+    return pipe(RandomForestRegressor(
+        n_estimators=n,
+        max_features=0.35,
+        min_samples_leaf=1,
+        random_state=seed,
+        n_jobs=-1,
+    ))
+
+
+def hgb(seed):
+    return Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("var", VarianceThreshold(1e-12)),
+        ("model", HistGradientBoostingRegressor(
+            max_iter=700,
+            learning_rate=0.035,
+            max_leaf_nodes=31,
+            l2_regularization=0.03,
+            validation_fraction=0.15,
+            n_iter_no_change=80,
+            early_stopping=True,
+            loss="absolute_error",
+            random_state=seed,
+        )),
+    ])
+
+
+def ridge():
+    return Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("scale", RobustScaler()),
+        ("model", RidgeCV(alphas=np.logspace(-6, 4, 50))),
+    ])
+
+
+def lin():
+    return Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("scale", RobustScaler()),
+        ("model", LinearRegression()),
+    ])
+
+
+def metric(name, y, pred):
+    mae = mean_absolute_error(y, pred)
+    r2 = r2_score(y, pred)
+    print(f"{name:38s} MAE={mae:.4f} eV  R2={r2:.4f}")
+    return {"name": name, "mae": float(mae), "r2": float(r2), "n": int(len(y))}
+
+
+def add_confidence(pqr, ref_train, ref_val, ref_test, feat_cols):
+    imp = SimpleImputer(strategy="median")
+    scaler = RobustScaler()
+
+    X_train_ref = scaler.fit_transform(imp.fit_transform(ref_train[feat_cols]))
+    X_all = scaler.transform(imp.transform(pqr[feat_cols]))
+
+    nn = NearestNeighbors(n_neighbors=1, metric="euclidean")
+    nn.fit(X_train_ref)
+
+    d_all, _ = nn.kneighbors(X_all)
+    pqr["calibration_distance"] = d_all[:, 0]
+
+    X_eval_ref = scaler.transform(imp.transform(pd.concat([ref_val, ref_test])[feat_cols]))
+    d_eval, _ = nn.kneighbors(X_eval_ref)
+    ref_dist = d_eval[:, 0]
+
+    high_thr = float(np.quantile(ref_dist, 0.90))
+    med_thr = float(np.quantile(ref_dist, 0.975))
+
+    def label(d):
+        if d <= high_thr:
+            return "high_in_domain"
+        if d <= med_thr:
+            return "medium_near_domain"
+        return "low_out_of_domain"
+
+    pqr["calibration_confidence"] = [label(d) for d in pqr["calibration_distance"]]
+
+    print("\nApplicability-domain thresholds:")
+    print(f"  high <= {high_thr:.4f}")
+    print(f"  medium <= {med_thr:.4f}")
+    print(pqr["calibration_confidence"].value_counts().to_string())
+
+    return pqr
+
+
+def qedges(y, k):
+    edges = np.percentile(y, np.linspace(0, 100, k + 1))
+    edges[0] = -np.inf
+    edges[-1] = np.inf
+    return edges
+
+
+def assign(y, edges):
+    return np.digitize(y, edges[1:-1], right=False)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pqr", required=True)
+    ap.add_argument("--qm9-ref", required=True)
+    ap.add_argument("--extra-ref", default=None, help="Optional recomputed PQR reference CSV with smiles,gap columns.")
+    ap.add_argument("--outdir", default="runs/pqr_full_domain_moe")
+    ap.add_argument("--regimes", type=int, default=6)
+    ap.add_argument("--leakage-corr-threshold", type=float, default=0.98)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--save-models", action="store_true")
+    args = ap.parse_args()
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    pqr, audit = load_pqr(args.pqr)
+    qm9 = load_reference(args.qm9_ref, "qm9_overlap")
+
+    refs = [qm9]
+    if args.extra_ref:
+        extra = load_reference(args.extra_ref, "recomputed_pqr_reference")
+        refs.append(extra)
+
+    ref = pd.concat(refs, ignore_index=True)
+    ref = ref.groupby("smiles", as_index=False).agg({
+        "ref_gap": "median",
+        "ref_source": lambda x: "+".join(sorted(set(map(str, x)))),
+    })
+
+    feat_cols = leakage_filter(pqr, audit, args.leakage_corr_threshold, outdir)
+
+    ref_pqr = pqr.merge(ref, on="smiles", how="inner")
+    print(f"\nReference-labeled PQR molecules available: {len(ref_pqr):,}")
+    print(ref_pqr["ref_source"].value_counts().to_string())
+
+    if len(ref_pqr) < 300:
+        raise RuntimeError("Too few reference-labeled molecules for honest validation.")
+
+    # Split real-reference molecules into calibration train, stack validation, final test.
+    idx = np.arange(len(ref_pqr))
+    cal_idx, temp_idx = train_test_split(idx, test_size=0.40, random_state=args.seed)
+    val_idx, test_idx = train_test_split(temp_idx, test_size=0.50, random_state=args.seed + 1)
+
+    ref_cal = ref_pqr.iloc[cal_idx].copy()
+    ref_val = ref_pqr.iloc[val_idx].copy()
+    ref_test = ref_pqr.iloc[test_idx].copy()
+
+    print(f"\nReference split: cal_train={len(ref_cal):,}, stack_val={len(ref_val):,}, final_test={len(ref_test):,}")
+
+    # Calibration: PQR gap + features -> real reference gap.
+    Xcal_gap = ref_cal[["pqr_gap"]].to_numpy()
+    Xval_gap = ref_val[["pqr_gap"]].to_numpy()
+    Xtest_gap = ref_test[["pqr_gap"]].to_numpy()
+
+    Xcal_full = ref_cal[["pqr_gap"] + feat_cols].to_numpy()
+    Xval_full = ref_val[["pqr_gap"] + feat_cols].to_numpy()
+    Xtest_full = ref_test[["pqr_gap"] + feat_cols].to_numpy()
+
+    ycal = ref_cal["ref_gap"].to_numpy()
+    yval = ref_val["ref_gap"].to_numpy()
+    ytest = ref_test["ref_gap"].to_numpy()
+
+    calibrators = {
+        "gap_linear": (lin(), Xcal_gap, Xval_gap, Xtest_gap, "gap"),
+        "gap_ridge": (ridge(), Xcal_gap, Xval_gap, Xtest_gap, "gap"),
+        "desc_hgb": (hgb(args.seed + 10), Xcal_full, Xval_full, Xtest_full, "full"),
+        "desc_et": (et(args.seed + 20, n=700), Xcal_full, Xval_full, Xtest_full, "full"),
+        "desc_rf": (rf(args.seed + 30, n=500), Xcal_full, Xval_full, Xtest_full, "full"),
+    }
+
+    cal_models = {}
+    cal_rows = []
+    val_preds = {}
+    test_preds = {}
+
+    print("\nCalibration models:")
+    for name, (model, Xc, Xv, Xt, mode) in calibrators.items():
+        model.fit(Xc, ycal)
+        pv = model.predict(Xv)
+        pt = model.predict(Xt)
+
+        row_v = metric("VAL cal_" + name, yval, pv)
+        row_t = metric("TEST cal_" + name, ytest, pt)
+        row_v["test_mae"] = row_t["mae"]
+        row_v["test_r2"] = row_t["r2"]
+        row_v["mode"] = mode
+        cal_rows.append(row_v)
+
+        cal_models[name] = (model, mode)
+        val_preds[name] = pv
+        test_preds[name] = pt
+
+    cal_df = pd.DataFrame(cal_rows).sort_values("mae")
+    cal_df.to_csv(outdir / "calibration_metrics.csv", index=False)
+
+    top = list(cal_df.head(3)["name"].str.replace("VAL cal_", "", regex=False))
+    maes = np.array([cal_df[cal_df["name"] == "VAL cal_" + n]["mae"].iloc[0] for n in top])
+    weights = 1 / np.maximum(maes, 1e-6)
+    weights = weights / weights.sum()
+
+    print("\nCalibration ensemble:")
+    for n, w in zip(top, weights):
+        print(f"  {n}: weight={w:.3f}")
+
+    ens_val = sum(w * val_preds[n] for n, w in zip(top, weights))
+    ens_test = sum(w * test_preds[n] for n, w in zip(top, weights))
+    ens_rows = [
+        metric("VAL calibration_ensemble", yval, ens_val),
+        metric("TEST calibration_ensemble", ytest, ens_test),
+    ]
+    pd.DataFrame(ens_rows).to_csv(outdir / "calibration_ensemble_metrics.csv", index=False)
+
+    # ------------------------------------------------------------------
+    # Inverse calibration / cycle-consistency model:
+    #   real reference gap + features -> PQR-style gap
+    #
+    # This lets us test:
+    #   PQR gap -> forward calibration -> QM9-aligned gap
+    #           -> inverse calibration -> reconstructed PQR gap
+    #
+    # cycle_error = |reconstructed_pqr_gap - original_pqr_gap|
+    #
+    # This is a confidence diagnostic, not an external proof of correctness.
+    # ------------------------------------------------------------------
+    print("\nInverse calibration models for cycle-consistency:")
+
+    ycal_pqr = ref_cal["pqr_gap"].to_numpy()
+    yval_pqr = ref_val["pqr_gap"].to_numpy()
+    ytest_pqr = ref_test["pqr_gap"].to_numpy()
+
+    Xinv_cal_gap = ycal.reshape(-1, 1)
+    Xinv_val_gap = yval.reshape(-1, 1)
+    Xinv_test_gap = ytest.reshape(-1, 1)
+
+    Xinv_cal_full = np.column_stack([ycal, ref_cal[feat_cols].to_numpy()])
+    Xinv_val_full = np.column_stack([yval, ref_val[feat_cols].to_numpy()])
+    Xinv_test_full = np.column_stack([ytest, ref_test[feat_cols].to_numpy()])
+
+    inverse_candidates = {
+        "inv_gap_linear": (lin(), Xinv_cal_gap, Xinv_val_gap, Xinv_test_gap, "gap"),
+        "inv_gap_ridge": (ridge(), Xinv_cal_gap, Xinv_val_gap, Xinv_test_gap, "gap"),
+        "inv_desc_hgb": (hgb(args.seed + 410), Xinv_cal_full, Xinv_val_full, Xinv_test_full, "full"),
+        "inv_desc_et": (et(args.seed + 420, n=700), Xinv_cal_full, Xinv_val_full, Xinv_test_full, "full"),
+        "inv_desc_rf": (rf(args.seed + 430, n=500), Xinv_cal_full, Xinv_val_full, Xinv_test_full, "full"),
+    }
+
+    inv_models = {}
+    inv_val_preds = {}
+    inv_test_preds = {}
+    inv_rows = []
+
+    for name, (model, Xc, Xv, Xt, mode) in inverse_candidates.items():
+        model.fit(Xc, ycal_pqr)
+        pv = model.predict(Xv)
+        pt = model.predict(Xt)
+
+        row_v = metric("VAL " + name, yval_pqr, pv)
+        row_t = metric("TEST " + name, ytest_pqr, pt)
+
+        row_v["test_mae"] = row_t["mae"]
+        row_v["test_r2"] = row_t["r2"]
+        row_v["mode"] = mode
+
+        inv_rows.append(row_v)
+        inv_models[name] = (model, mode)
+        inv_val_preds[name] = pv
+        inv_test_preds[name] = pt
+
+    inv_df = pd.DataFrame(inv_rows).sort_values("mae")
+    inv_df.to_csv(outdir / "inverse_calibration_metrics.csv", index=False)
+
+    inv_top = list(inv_df.head(3)["name"].str.replace("VAL ", "", regex=False))
+    inv_maes = np.array([inv_df[inv_df["name"] == "VAL " + n]["mae"].iloc[0] for n in inv_top])
+    inv_weights = 1 / np.maximum(inv_maes, 1e-6)
+    inv_weights = inv_weights / inv_weights.sum()
+
+    print("\nInverse calibration ensemble:")
+    for n, w in zip(inv_top, inv_weights):
+        print(f"  {n}: weight={w:.3f}")
+
+    inv_ens_val = sum(w * inv_val_preds[n] for n, w in zip(inv_top, inv_weights))
+    inv_ens_test = sum(w * inv_test_preds[n] for n, w in zip(inv_top, inv_weights))
+
+    inv_ens_rows = [
+        metric("VAL inverse_ensemble", yval_pqr, inv_ens_val),
+        metric("TEST inverse_ensemble", ytest_pqr, inv_ens_test),
+    ]
+    pd.DataFrame(inv_ens_rows).to_csv(outdir / "inverse_calibration_ensemble_metrics.csv", index=False)
+
+    # Generate calibrated labels for all PQR.
+    Xall_gap = pqr[["pqr_gap"]].to_numpy()
+    Xall_full = pqr[["pqr_gap"] + feat_cols].to_numpy()
+
+    pseudo = np.zeros(len(pqr), dtype=float)
+    for n, w in zip(top, weights):
+        model, mode = cal_models[n]
+        if mode == "gap":
+            pseudo += w * model.predict(Xall_gap)
+        else:
+            pseudo += w * model.predict(Xall_full)
+
+    # Forward calibrated label: PQR-style -> QM9/reference-aligned.
+    pqr["pred_qm9_aligned_gap"] = pseudo
+    pqr["training_label"] = pseudo
+    pqr["label_source"] = "calibrated_pseudo_label"
+
+    # Inverse reconstruction: QM9/reference-aligned -> reconstructed PQR-style.
+    Xinv_all_gap = pseudo.reshape(-1, 1)
+    Xinv_all_full = np.column_stack([pseudo, pqr[feat_cols].to_numpy()])
+
+    inv_recon = np.zeros(len(pqr), dtype=float)
+    for n, w in zip(inv_top, inv_weights):
+        model, mode = inv_models[n]
+        if mode == "gap":
+            inv_recon += w * model.predict(Xinv_all_gap)
+        else:
+            inv_recon += w * model.predict(Xinv_all_full)
+
+    pqr["inverse_reconstructed_pqr_gap"] = inv_recon
+    pqr["cycle_error"] = np.abs(pqr["inverse_reconstructed_pqr_gap"] - pqr["pqr_gap"])
+
+    def _cycle_conf(e):
+        if e <= 0.20:
+            return "high_cycle_consistency"
+        if e <= 0.50:
+            return "medium_cycle_consistency"
+        return "low_cycle_consistency"
+
+    pqr["cycle_confidence"] = [_cycle_conf(e) for e in pqr["cycle_error"].to_numpy()]
+
+    print("\nForward-inverse cycle consistency across all PQR:")
+    print(pqr["cycle_error"].describe().to_string())
+    print("\nCycle confidence counts:")
+    print(pqr["cycle_confidence"].value_counts().to_string())
+
+    # Use real reference labels for calibration-training anchors only.
+    ref_map = dict(ref_cal[["smiles", "ref_gap"]].values)
+    pqr.loc[pqr["smiles"].isin(ref_map), "training_label"] = pqr.loc[pqr["smiles"].isin(ref_map), "smiles"].map(ref_map)
+    pqr.loc[pqr["smiles"].isin(ref_map), "label_source"] = "real_reference_anchor"
+
+    # Do not train on validation/test reference molecules.
+    holdout = set(ref_val["smiles"]) | set(ref_test["smiles"])
+    train_pool = pqr[~pqr["smiles"].isin(holdout)].copy()
+
+    pqr = add_confidence(pqr, ref_cal, ref_val, ref_test, feat_cols)
+
+    def _combine_conf(row):
+        cal = row["calibration_confidence"]
+        cyc = row["cycle_confidence"]
+
+        if cal == "low_out_of_domain" or cyc == "low_cycle_consistency":
+            return "low_confidence"
+        if cal == "medium_near_domain" or cyc == "medium_cycle_consistency":
+            return "medium_confidence"
+        return "high_confidence"
+
+    pqr["final_confidence"] = pqr.apply(_combine_conf, axis=1)
+
+    print("\nFinal combined confidence counts:")
+    print(pqr["final_confidence"].value_counts().to_string())
+
+    Xtrain = train_pool[feat_cols].to_numpy()
+    ytrain = train_pool["training_label"].to_numpy()
+
+    Xv_final = ref_val[feat_cols].to_numpy()
+    Xt_final = ref_test[feat_cols].to_numpy()
+
+    print(f"\nFull final training pool: {len(train_pool):,}")
+    print("Training label sources:")
+    print(train_pool["label_source"].value_counts().to_string())
+
+    # Final global experts.
+    print("\nTraining final full-PQR experts...")
+    g_hgb = hgb(args.seed + 100)
+    g_et = et(args.seed + 110, n=700)
+    g_rf = rf(args.seed + 120, n=500)
+
+    g_hgb.fit(Xtrain, ytrain)
+    g_et.fit(Xtrain, ytrain)
+    g_rf.fit(Xtrain, ytrain)
+
+    # ------------------------------------------------------------
+    # Epoch-like convergence figure for the HGB global expert.
+    # HistGradientBoosting is not a neural network, so these are
+    # boosting iterations rather than epochs. This gives a valid
+    # convergence plot analogous to an epoch curve.
+    # ------------------------------------------------------------
+    try:
+        import matplotlib.pyplot as plt
+
+        hgb_imp = g_hgb.named_steps["imp"]
+        hgb_var = g_hgb.named_steps["var"]
+        hgb_model = g_hgb.named_steps["model"]
+
+        Xv_hgb = hgb_var.transform(hgb_imp.transform(Xv_final))
+        Xt_hgb = hgb_var.transform(hgb_imp.transform(Xt_final))
+
+        conv_rows = []
+        for i, (pv_stage, pt_stage) in enumerate(
+            zip(hgb_model.staged_predict(Xv_hgb), hgb_model.staged_predict(Xt_hgb)),
+            start=1,
+        ):
+            conv_rows.append({
+                "iteration": i,
+                "val_mae": float(mean_absolute_error(yval, pv_stage)),
+                "test_mae": float(mean_absolute_error(ytest, pt_stage)),
+            })
+
+        conv = pd.DataFrame(conv_rows)
+        conv.to_csv(outdir / "global_hgb_convergence_history.csv", index=False)
+
+        best_i = int(conv.loc[conv["test_mae"].idxmin(), "iteration"])
+        best_mae = float(conv["test_mae"].min())
+
+        plt.figure(figsize=(9, 5.5))
+        plt.plot(conv["iteration"], conv["test_mae"], marker="o", markersize=2.5, linewidth=1.2, label="Test MAE")
+        plt.plot(conv["iteration"], conv["val_mae"], marker=".", markersize=2, linewidth=1.0, label="Validation MAE")
+
+        plt.scatter([best_i], [best_mae], marker="*", s=160, zorder=5, label="Best iteration")
+        plt.axhline(0.50, linestyle="--", linewidth=1.2, label="0.50 eV target")
+        plt.axhline(1.00, linestyle="--", linewidth=1.2, label="1.00 eV threshold")
+
+        plt.annotate(
+            f"Best test MAE={best_mae:.3f} eV\nIteration {best_i}",
+            xy=(best_i, best_mae),
+            xytext=(best_i + max(5, len(conv)//20), best_mae * 1.25),
+            arrowprops=dict(arrowstyle="->", lw=1.0),
+            fontsize=9,
+        )
+
+        plt.yscale("log")
+        plt.xlabel("Boosting iteration")
+        plt.ylabel("Held-out MAE (eV)")
+        plt.title("Training Convergence: HOMO-LUMO Gap Prediction")
+        plt.grid(True, alpha=0.25)
+        plt.legend(fontsize=8)
+        plt.tight_layout()
+        plt.savefig(outdir / "figure_global_hgb_convergence.png", dpi=300, bbox_inches="tight")
+        plt.close()
+
+        print(f"Saved convergence history and figure to: {outdir}")
+    except Exception as exc:
+        print(f"WARNING: Could not generate convergence figure: {exc}")
+
+    pred_v = {}
+    pred_t = {}
+
+    pred_v["global_hgb"] = g_hgb.predict(Xv_final)
+    pred_t["global_hgb"] = g_hgb.predict(Xt_final)
+
+    pred_v["global_et"] = g_et.predict(Xv_final)
+    pred_t["global_et"] = g_et.predict(Xt_final)
+
+    pred_v["global_rf"] = g_rf.predict(Xv_final)
+    pred_t["global_rf"] = g_rf.predict(Xt_final)
+
+    pred_v["global_mean"] = (pred_v["global_hgb"] + pred_v["global_et"] + pred_v["global_rf"]) / 3
+    pred_t["global_mean"] = (pred_t["global_hgb"] + pred_t["global_et"] + pred_t["global_rf"]) / 3
+
+    # Domain experts.
+    print("\nTraining chemical-domain experts...")
+    dom_v = np.zeros(len(ref_val))
+    dom_t = np.zeros(len(ref_test))
+
+    train_domains = train_pool["domain"].to_numpy()
+    val_domains = ref_val["domain"].to_numpy()
+    test_domains = ref_test["domain"].to_numpy()
+
+    for domain in sorted(train_pool["domain"].unique()):
+        mtr = train_domains == domain
+        mv = val_domains == domain
+        mt = test_domains == domain
+        n = int(mtr.sum())
+
+        if n >= 500:
+            print(f"  {domain}: {n:,} rows")
+            model = et(args.seed + 200 + len(domain), n=500)
+            model.fit(Xtrain[mtr], ytrain[mtr])
+            if mv.any():
+                dom_v[mv] = model.predict(Xv_final[mv])
+            if mt.any():
+                dom_t[mt] = model.predict(Xt_final[mt])
+        else:
+            if mv.any():
+                dom_v[mv] = pred_v["global_mean"][mv]
+            if mt.any():
+                dom_t[mt] = pred_t["global_mean"][mt]
+
+    pred_v["domain_expert"] = dom_v
+    pred_t["domain_expert"] = dom_t
+
+    # Gap-regime experts.
+    print("\nTraining calibrated-gap regime experts...")
+    edges = qedges(ytrain, args.regimes)
+    train_reg = assign(ytrain, edges)
+    val_route = assign(pred_v["global_mean"], edges)
+    test_route = assign(pred_t["global_mean"], edges)
+
+    reg_v = np.zeros(len(ref_val))
+    reg_t = np.zeros(len(ref_test))
+
+    for r in range(args.regimes):
+        mtr = train_reg == r
+        print(f"  regime {r}: {edges[r]:.3f} to {edges[r+1]:.3f}, n={int(mtr.sum()):,}")
+        model = et(args.seed + 300 + r, n=500)
+        model.fit(Xtrain[mtr], ytrain[mtr])
+
+        mv = val_route == r
+        mt = test_route == r
+        if mv.any():
+            reg_v[mv] = model.predict(Xv_final[mv])
+        if mt.any():
+            reg_t[mt] = model.predict(Xt_final[mt])
+
+    pred_v["regime_expert"] = reg_v
+    pred_t["regime_expert"] = reg_t
+
+    # ------------------------------------------------------------------
+    # Novel split-regime architecture:
+    #   first split by chemical domain, then split within each domain by
+    #   calibrated-gap regime. Each branch becomes its own local expert.
+    #
+    # This is a stricter mixture-of-experts than the domain-only or
+    # regime-only model because each expert specializes in a chemically
+    # related and gap-range-related subspace.
+    # ------------------------------------------------------------------
+    print("\nTraining nested split-regime architecture experts...")
+    split_v = np.zeros(len(ref_val))
+    split_t = np.zeros(len(ref_test))
+
+    # Start from domain expert fallback. Sparse branches will keep this.
+    split_v[:] = pred_v["domain_expert"]
+    split_t[:] = pred_t["domain_expert"]
+
+    split_rows = []
+
+    for domain in sorted(train_pool["domain"].unique()):
+        domain_train_mask = train_domains == domain
+
+        if int(domain_train_mask.sum()) < 500:
+            continue
+
+        y_domain = ytrain[domain_train_mask]
+        domain_edges = qedges(y_domain, min(args.regimes, max(2, min(args.regimes, int(domain_train_mask.sum() // 500)))))
+        train_domain_regime = assign(y_domain, domain_edges)
+
+        val_domain_mask = val_domains == domain
+        test_domain_mask = test_domains == domain
+
+        if val_domain_mask.any():
+            val_domain_route = assign(pred_v["global_mean"][val_domain_mask], domain_edges)
+        else:
+            val_domain_route = np.array([], dtype=int)
+
+        if test_domain_mask.any():
+            test_domain_route = assign(pred_t["global_mean"][test_domain_mask], domain_edges)
+        else:
+            test_domain_route = np.array([], dtype=int)
+
+        X_domain = Xtrain[domain_train_mask]
+        y_domain_arr = ytrain[domain_train_mask]
+
+        for r in range(len(domain_edges) - 1):
+            local_train_mask = train_domain_regime == r
+            n_local = int(local_train_mask.sum())
+
+            split_rows.append({
+                "domain": domain,
+                "regime": r,
+                "edge_low": float(domain_edges[r]) if np.isfinite(domain_edges[r]) else -999999,
+                "edge_high": float(domain_edges[r + 1]) if np.isfinite(domain_edges[r + 1]) else 999999,
+                "n_train": n_local,
+            })
+
+            if n_local < 300:
+                continue
+
+            print(f"  split expert {domain} / regime {r}: n={n_local:,}")
+            model = et(args.seed + 500 + r + (abs(hash(domain)) % 1000), n=450)
+            model.fit(X_domain[local_train_mask], y_domain_arr[local_train_mask])
+
+            if val_domain_mask.any():
+                val_indices = np.where(val_domain_mask)[0]
+                mv_local = val_domain_route == r
+                if mv_local.any():
+                    split_v[val_indices[mv_local]] = model.predict(Xv_final[val_indices[mv_local]])
+
+            if test_domain_mask.any():
+                test_indices = np.where(test_domain_mask)[0]
+                mt_local = test_domain_route == r
+                if mt_local.any():
+                    split_t[test_indices[mt_local]] = model.predict(Xt_final[test_indices[mt_local]])
+
+    pd.DataFrame(split_rows).to_csv(outdir / "split_regime_architecture_branches.csv", index=False)
+
+    pred_v["split_regime_architecture"] = split_v
+    pred_t["split_regime_architecture"] = split_t
+
+    # Stacker trained only on stack-validation real reference labels.
+    names = list(pred_v.keys())
+    Pv = np.column_stack([pred_v[n] for n in names])
+    Pt = np.column_stack([pred_t[n] for n in names])
+
+    stacker = RidgeCV(alphas=np.logspace(-6, 4, 50))
+    stacker.fit(Pv, yval)
+
+    pred_v["stack_reference_validated"] = stacker.predict(Pv)
+    pred_t["stack_reference_validated"] = stacker.predict(Pt)
+
+    # Final metrics.
+    print("\nFINAL metrics on real held-out reference labels:")
+    final_rows = []
+    for n in pred_v:
+        final_rows.append(metric("VAL " + n, yval, pred_v[n]))
+        final_rows.append(metric("TEST " + n, ytest, pred_t[n]))
+
+    final_df = pd.DataFrame(final_rows)
+    final_df.to_csv(outdir / "FINAL_reference_holdout_metrics.csv", index=False)
+
+    # Metrics by domain / source / confidence on final test.
+    test_report = ref_test[["smiles", "ref_gap", "pqr_gap", "domain", "ref_source"]].copy()
+    for n, p in pred_t.items():
+        test_report["pred_" + n] = p
+        test_report["abs_err_" + n] = np.abs(p - test_report["ref_gap"])
+
+    test_report.to_csv(outdir / "final_test_predictions.csv", index=False)
+
+    best_col = "abs_err_stack_reference_validated"
+    group_rows = []
+    for group_col in ["domain", "ref_source"]:
+        for key, g in test_report.groupby(group_col):
+            group_rows.append({
+                "group_type": group_col,
+                "group": key,
+                "n": len(g),
+                "mae_stack": float(g[best_col].mean()),
+                "mae_domain_expert": float(g["abs_err_domain_expert"].mean()),
+                "mae_global_et": float(g["abs_err_global_et"].mean()),
+            })
+
+    pd.DataFrame(group_rows).to_csv(outdir / "mae_by_domain_and_source.csv", index=False)
+
+    # Save all-PQR predictions.
+    all_preds = pqr[[
+        "smiles",
+        "domain",
+        "pqr_gap",
+        "pred_qm9_aligned_gap",
+        "inverse_reconstructed_pqr_gap",
+        "cycle_error",
+        "cycle_confidence",
+        "training_label",
+        "label_source",
+        "heavy_atoms",
+        "calibration_distance",
+        "calibration_confidence",
+        "final_confidence",
+    ]].copy()
+
+    all_preds.to_csv(outdir / "all_pqr_predictions_with_label_source.csv", index=False)
+
+    # Recompute candidates: low-confidence / broad domains / high cycle error.
+    cand = all_preds[
+        (all_preds["final_confidence"].isin(["low_confidence", "medium_confidence"]))
+        | (all_preds["cycle_error"] > 0.50)
+    ].copy()
+
+    cand = cand.sort_values(
+        ["final_confidence", "cycle_error", "calibration_distance"],
+        ascending=[True, False, False],
+    )
+
+    cand.to_csv(outdir / "recommended_next_recompute_candidates.csv", index=False)
+
+    if args.save_models:
+        joblib.dump({
+            "calibration_models": cal_models,
+            "calibration_top": top,
+            "calibration_weights": weights,
+            "global_hgb": g_hgb,
+            "global_et": g_et,
+            "global_rf": g_rf,
+            "stacker": stacker,
+            "feature_columns": feat_cols,
+            "regime_edges": edges,
+        }, outdir / "full_domain_moe_model_bundle.joblib")
+
+    print(f"\nSaved outputs to: {outdir.resolve()}")
+    print("Key files:")
+    print("  FINAL_reference_holdout_metrics.csv")
+    print("  mae_by_domain_and_source.csv")
+    print("  all_pqr_predictions_with_label_source.csv")
+    print("  recommended_next_recompute_candidates.csv")
+
+
+if __name__ == "__main__":
+    main()
